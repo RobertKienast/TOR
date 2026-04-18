@@ -20,3 +20,15 @@ none (kinda same  a bit better than * g)
   mnist_test                 2.3891     2.1493     0.4573  [Adam]
 (venv) PS C:\Users\robki\Downloads\files> 
 beta - 0.2
+
+1.03 fixed 
+
+
+============================================================
+  Summary (final loss ↓ is better)
+  Problem                       GNN        SGD       Adam
+  ----------------------------------------------------
+  quadratic_test             7.8556    -9.1264    -3.4159  [SGD]
+  lasso_test                10.0679     2.4983     2.5714  [SGD]
+  rastrigin_test           135.4633   595.4667   286.9049  [✓GNN]
+  mnist_test                 2.3888     2.1493     0.4573  [Adam]

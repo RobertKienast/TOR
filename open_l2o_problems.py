@@ -32,8 +32,9 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from torch.utils.data import DataLoader
+from torch.nn.utils.stateless import functional_call
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -43,17 +44,17 @@ from torch.utils.data import DataLoader
 class Optimizee:
     """Abstract optimizee.  All Open-L2O problems subclass this."""
 
-    def loss(self) -> torch.Tensor:
+    def loss(self, params: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
         raise NotImplementedError
 
     def reset(self, seed: Optional[int] = None):
         raise NotImplementedError
 
-    def params(self) -> List[torch.Tensor]:
+    def params(self) -> Dict[str, torch.Tensor]:
         raise NotImplementedError
 
     def zero_grad(self):
-        for p in self.params():
+        for p in self.params().values():
             if p.grad is not None:
                 p.grad.zero_()
 
@@ -93,11 +94,14 @@ class QuadraticProblem(Optimizee):
         # Optimizee variable
         self._x = nn.Parameter(torch.randn(self.dim, device=self.device))
 
-    def loss(self) -> torch.Tensor:
-        return (self._x @ self.A @ self._x + self.b @ self._x)
+    def loss(self, params: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
+        if params is None:
+            params = self.params()
+        x = params["x"]
+        return (x @ self.A @ x + self.b @ x)
 
-    def params(self) -> List[torch.Tensor]:
-        return [self._x]
+    def params(self) -> Dict[str, torch.Tensor]:
+        return {"x": self._x}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -128,12 +132,17 @@ class LASSOProblem(Optimizee):
         self.b_vec = torch.randn(self.m, device=self.device)
         self._x = nn.Parameter(torch.zeros(self.n, device=self.device))
 
-    def loss(self) -> torch.Tensor:
-        residual = self.A_mat @ self._x - self.b_vec
-        return 0.5 * residual.pow(2).sum() + self.lam * self._x.abs().sum()
+    def loss(self, params: Optional[Dict[str, torch.Tensor]] = None):
+        if params is None:
+            params = self.params()
 
-    def params(self) -> List[torch.Tensor]:
-        return [self._x]
+        x = params["x"]   # ✅ MUST be dict access
+
+        residual = self.A_mat @ x - self.b_vec
+        return 0.5 * residual.pow(2).sum() + self.lam * x.abs().sum()
+
+    def params(self) -> Dict[str, torch.Tensor]:
+        return {"x": self._x}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -159,13 +168,16 @@ class RastriginProblem(Optimizee):
         init = torch.FloatTensor(self.dim).uniform_(-5.12, 5.12).to(self.device)
         self._x = nn.Parameter(init)
 
-    def loss(self) -> torch.Tensor:
+    def loss(self, params: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
+        if params is None:
+            params = self.params()
+        x = params["x"]
         n = self.dim
         return (10 * n
-                + (self._x.pow(2) - 10 * torch.cos(2 * math.pi * self._x)).sum())
+                + (x.pow(2) - 10 * torch.cos(2 * math.pi * x)).sum())
 
-    def params(self) -> List[torch.Tensor]:
-        return [self._x]
+    def params(self) -> Dict[str, torch.Tensor]:
+        return {"x": self._x}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -214,12 +226,16 @@ class _NetworkOptimizee(Optimizee):
             x, y = next(self._iter)
         return x.to(self.device), y.to(self.device)
 
-    def loss(self) -> torch.Tensor:
+    def loss(self, params: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
         x, y = self._next_batch()
-        return F.cross_entropy(self.net(x), y)
+        if params is None:
+            logits = self.net(x)
+        else:
+            logits = functional_call(self.net, params, (x,))
+        return F.cross_entropy(logits, y)
 
-    def params(self) -> List[torch.Tensor]:
-        return list(self.net.parameters())
+    def params(self) -> Dict[str, torch.Tensor]:
+        return dict(self.net.named_parameters())
 
     def reset(self, seed: Optional[int] = None):
         if seed is not None:
