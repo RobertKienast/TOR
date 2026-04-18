@@ -379,9 +379,12 @@ class GNNMetaLearner(nn.Module):
 
             # Stability tweak: RMS-normalize momentum instead of strict unit-norm direction.
             m_rms = m_new.pow(2).mean().sqrt().clamp(min=1e-8)
-            m_unit = m_new / m_rms
+            m_unit = m_new / (m_rms + 1e-8)
 
             update = step_size[i] * deltas[i] * self.update_lr * m_unit
+            # Cap per-node RMS update magnitude to suppress rare destabilizing jumps.
+            upd_rms = update.pow(2).mean().sqrt().clamp(min=1e-8)
+            update = update * (0.1 / (upd_rms + 1e-8)).clamp(max=1.0)
 
             # 🔥 THIS IS THE IMPORTANT LINE
             new_params[name] = p + update
@@ -443,20 +446,20 @@ class GNNMetaLearner(nn.Module):
                 m_new = beta * m_prev + (1.0 - beta) * g
                 buffers[name] = m_new
 
-                m_norm = m_new.norm()
-                if m_norm > 1e-7:
-                    m_unit = m_new / m_norm
-                else:
-                    m_unit = torch.zeros_like(m_new)
+                m_rms = m_new.pow(2).mean().sqrt().clamp(min=1e-8)
+                m_unit = m_new / (m_rms + 1e-8)
 
                 update = step_scale * delta * self.update_lr * m_unit
+                upd_rms = update.pow(2).mean().sqrt().clamp(min=1e-8)
+                update = update * (0.1 / (upd_rms + 1e-8)).clamp(max=1.0)
                 p_new = p + update
 
                 clip_val = self.bias_clip if node.is_bias else self.weight_clip
                 if clip_val is not None:
                     p_new = p_new.clamp(-clip_val, clip_val)
 
-                new_params[name] = p_new
+                # Re-leaf for next eval step so autograd.grad can compute fresh grads.
+                new_params[name] = p_new.detach().requires_grad_(True)
 
         next_loss = optimizee.loss(new_params)
         return next_loss.item(), new_params, buffers
@@ -494,9 +497,9 @@ def meta_train(
     history = []
     ema_loss = None
 
-    #if seed is not None:
-    #    random.seed(seed)
-    #    torch.manual_seed(seed)
+    if seed is not None:
+        random.seed(seed)
+        torch.manual_seed(seed)
 
     problems = [make_problem(n, device=device) for n in problem_names]
 
@@ -511,7 +514,10 @@ def meta_train(
         # Cycle through problems
         prob = problems[(epoch - 1) % len(problems)]
         # Randomize optimizee seed each epoch (reproducible if --seed is fixed).
-        #prob.reset(seed=random.randint(0, 2**31 - 1))
+        if seed is None:
+            prob.reset(seed=None)
+        else:
+            prob.reset(seed=random.randint(0, 2**31 - 1))
 
         meta_opt.zero_grad()
         meta_loss = torch.tensor(0.0, device=device)
