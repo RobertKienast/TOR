@@ -98,68 +98,43 @@ class ParamNode:
             torch.tensor(math.log1p(step), dtype=torch.float32),
             torch.tensor(self.layer_idx / max(n_layers - 1, 1), dtype=torch.float32),
         ]).to(self.param.device)
-def build_graph(
-    optimizee: Optimizee,
-    step: int,
-) -> Tuple[List[ParamNode], torch.Tensor, torch.Tensor]:
-    """
-    Extract graph from an optimizee after loss.backward() has been called.
+def build_graph(self, params: List[torch.Tensor]):
+    nodes = []
+    layer_node_ids = [] # Track which IDs belong to which layer
+    current_id = 0
+    
+    # 1. Create nodes and track IDs per layer
+    for i, p in enumerate(params):
+        p_nodes = ParamNode(p, layer_idx=i)
+        nodes.append(p_nodes)
+        
+        # Store the range of IDs for this specific parameter/layer
+        num_params = p.numel()
+        layer_node_ids.append(list(range(current_id, current_id + num_params)))
+        current_id += num_params
 
-    Returns
-    -------
-    nodes      : list of ParamNode
-    node_feats : (N, NODE_DIM) float tensor
-    edge_index : (2, E) long tensor
-    """
-    nodes: List[ParamNode] = []
-    layer_buckets: Dict[int, List[int]] = {}
+    # 2. Build Edges
+    edge_list = []
+    num_layers = len(layer_node_ids)
+    
+    for i in range(num_layers):
+        # --- Intra-layer edges (Current logic) ---
+        # Connect parameters within the same layer (e.g., Weight <-> Bias)
+        for src in layer_node_ids[i]:
+            for dst in layer_node_ids[i]:
+                if src != dst:
+                    edge_list.append([src, dst])
+        
+        # --- Inter-layer edges (New logic) ---
+        # Connect Layer i to Layer i + 1
+        if i < num_layers - 1:
+            for src in layer_node_ids[i]:
+                for dst in layer_node_ids[i+1]:
+                    edge_list.append([src, dst]) # Forward edge
+                    edge_list.append([dst, src]) # Backward edge
 
-    layer_name_to_idx: Dict[str, int] = {}
-    params = optimizee.params()
-    for name, p in params.items():
-        if p.grad is None:
-            continue
-
-        # Group nodes by parameter prefix so weight/bias of same module share a layer.
-        layer_name = name.rsplit(".", 1)[0] if "." in name else "root"
-        if layer_name not in layer_name_to_idx:
-            layer_name_to_idx[layer_name] = len(layer_name_to_idx)
-        layer_idx = layer_name_to_idx[layer_name]
-
-        node = ParamNode(name, p, p.grad, layer_idx, name.endswith("bias"))
-        bucket = layer_buckets.setdefault(layer_idx, [])
-        bucket.append(len(nodes))
-        nodes.append(node)
-
-    if not nodes:
-        any_param = next(iter(params.values()))
-        device = any_param.device
-        empty = torch.zeros(2, 0, dtype=torch.long, device=device)
-        return nodes, torch.zeros(0, NODE_DIM, device=device), empty
-
-    n_layers = max(n.layer_idx for n in nodes) + 1
-    device = nodes[0].param.device
-
-    # Node feature matrix
-    node_feats = torch.stack(
-        [n.features(step, n_layers) for n in nodes]
-    ).to(device)  # (N, NODE_DIM)
-
-    # Intra-layer fully-connected edges
-    edges = []
-    for ids in layer_buckets.values():
-        for i in ids:
-            for j in ids:
-                if i != j:
-                    edges.append((i, j))
-
-    if edges:
-        edge_index = torch.tensor(edges, dtype=torch.long,
-                                  device=device).t().contiguous()
-    else:
-        edge_index = torch.zeros(2, 0, dtype=torch.long, device=device)
-
-    return nodes, node_feats, edge_index
+    edge_index = torch.tensor(edge_list, dtype=torch.long).t()
+    return nodes, edge_index
 
 
 def build_edges(nodes: List[ParamNode]) -> torch.Tensor:
@@ -189,6 +164,25 @@ def build_edges(nodes: List[ParamNode]) -> torch.Tensor:
 # GNN building blocks
 # ─────────────────────────────────────────────────────────────────────────────
 
+from torch_geometric.nn import GATv2Conv
+
+class GATv2MetaLayer(nn.Module):
+    def __init__(self, in_dim, out_dim, heads=4):
+        super().__init__()
+        # PyG's GATv2Conv handles the multi-head split and dynamic attention
+        self.conv = GATv2Conv(in_dim, out_dim // heads, heads=heads, concat=True)
+        self.norm = nn.LayerNorm(out_dim)
+        self.act = nn.SiLU()
+
+    def forward(self, h, edge_index):
+        # h: (N, in_dim), edge_index: (2, E)
+        res = h
+        h = self.conv(h, edge_index)
+        h = self.norm(h)
+        h = self.act(h)
+        # Assuming in_dim == out_dim for a residual connection
+        return h 
+    
 class EdgeNet(nn.Module):
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
@@ -217,25 +211,19 @@ class NodeUpdateNet(nn.Module):
 class GNNLayer(nn.Module):
     def __init__(self, node_dim: int, hidden_dim: int):
         super().__init__()
-        self.edge_net = EdgeNet(node_dim, hidden_dim)
+        self.hidden_dim = hidden_dim
+        self.edge_net = GATv2MetaLayer(node_dim, hidden_dim)
         self.node_net = NodeUpdateNet(node_dim, hidden_dim, hidden_dim)
 
     def forward(self, h: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         N, device = h.size(0), h.device
-        D = self.edge_net.mlp[-1].out_features
 
         if edge_index.size(1) == 0:
-            return self.node_net(h, torch.zeros(N, D, device=device))
+            return self.node_net(h, torch.zeros(N, self.hidden_dim, device=device))
 
-        src, dst = edge_index[0], edge_index[1]
-        msgs = self.edge_net(h[src], h[dst])                     # (E, D)
-        agg = torch.zeros(N, D, device=device)
-        cnt = torch.zeros(N, 1, device=device)
-        agg.scatter_add_(0, dst.unsqueeze(1).expand_as(msgs), msgs)
-        cnt.scatter_add_(0, dst.unsqueeze(1),
-                         torch.ones(dst.size(0), 1, device=device))
-        agg = agg / cnt.clamp(min=1)
-        return self.node_net(h, agg)                              # (N, D)
+        # GATv2 produces one message-aggregated representation per node.
+        agg = self.edge_net(h, edge_index)  # (N, hidden_dim)
+        return self.node_net(h, agg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
