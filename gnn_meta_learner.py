@@ -72,9 +72,11 @@ class ParamNode:
     def features(self, step: int, n_layers: int) -> torch.Tensor:
         w = self.param.data.float().flatten()
         g = self.grad.float().flatten()
+        w_log_norm = torch.log(1 + w.norm(2))
+        g_log_norm = torch.log(1 + g.norm(2))
         return torch.stack([
-            w.norm(2),
-            g.norm(2),
+            w_log_norm,
+            g_log_norm,
             w.mean(),
             g.mean(),
             w.std(),
@@ -242,7 +244,7 @@ class GNNMetaLearner(nn.Module):
     def __init__(self,
                  hidden_dim: int = 64,
                  num_gnn_layers: int = 3,
-                 update_lr: float = 0.01,
+                 update_lr: float = 0.1,
                  weight_clip: Optional[float] = None,
                  bias_clip: Optional[float] = None):
         super().__init__()
@@ -325,14 +327,14 @@ class GNNMetaLearner(nn.Module):
                 g = node.grad
                 m_prev = momentum_buffers.get(param_id, torch.zeros_like(g))
                 
-                beta = step_size
+                beta = 0.7
                 # Update rule: m_new = beta * m_prev + (1 - beta) * grad
                 m_new = beta * m_prev + (1.0 - beta) * g
                 momentum_buffers[param_id] = m_new  # Save for next step
 
                 
                 m_unit = m_new / (m_new.norm() + 1e-8)
-                node.param.data.add_(delta * self.update_lr * m_unit)
+                node.param.data.add_(step_size*delta * self.update_lr * m_unit)
 
                 # Clipping logic
                 clip_val = self.bias_clip if node.is_bias else self.weight_clip
@@ -379,11 +381,11 @@ class GNNMetaLearner(nn.Module):
 
         # 3. GNN Forward
         with torch.no_grad():
-            deltas, m_betas = self(node_feats, edge_index)
+            deltas, step_size = self(node_feats, edge_index)
 
         # 4. Apply Updates
         with torch.no_grad():
-            for i, (node, delta, beta) in enumerate(zip(nodes, deltas, m_betas)):
+            for i, (node, delta, SSize) in enumerate(zip(nodes, deltas, step_size)):
                 # We use the python object ID or the param itself as a key
                 param_id = id(node.param)
                 g = node.grad
@@ -392,6 +394,7 @@ class GNNMetaLearner(nn.Module):
                 m_prev = buffers.get(param_id, torch.zeros_like(g))
                 
                 # Update momentum: m = beta * m + (1-beta) * grad
+                beta = 0.7
                 m_new = beta * m_prev + (1.0 - beta) * g
                 buffers[param_id] = m_new  # Save for next step
                 
@@ -400,7 +403,7 @@ class GNNMetaLearner(nn.Module):
                 
                 # Update parameter
                 node.param.data.add_(
-                    delta.item() * self.update_lr * m_unit
+                    SSize * delta * self.update_lr * m_unit
                 )
 
                 # Optional clipping
@@ -477,8 +480,20 @@ def meta_train(
                   f"meta-loss = {val:.4f} | "
                   f"problem = {problem_names[(epoch-1) % len(problem_names)]}")
 
+    # Inside meta_train function (gnn_meta_learner.py)
     if save_path:
-        torch.save(meta.state_dict(), save_path)
+        # Create a dictionary containing weights AND the architecture config
+        checkpoint = {
+            'state_dict': meta.state_dict(),
+            'config': {
+                'hidden_dim': meta.input_proj[0].out_features, # Extract from model
+                'num_gnn_layers': len(meta.gnn),
+                'update_lr': meta.update_lr,
+                'weight_clip': meta.weight_clip,
+                'bias_clip': meta.bias_clip
+            }
+        }
+        torch.save(checkpoint, save_path)
         print(f"\n  Checkpoint saved → {save_path}")
 
     return history
@@ -617,16 +632,37 @@ def main():
     if args.cmd == "train":
         meta = GNNMetaLearner(hidden_dim=args.hidden,
                               num_gnn_layers=args.layers,
-                              update_lr=args.update_lr, weight_clip=1, bias_clip=0.1)
+                              update_lr=args.update_lr, weight_clip=1, bias_clip=0.3)
         meta_train(meta, args.problems,
                    epochs=args.epochs, unroll=args.unroll,
                    meta_lr=args.lr, device=args.device,
                    save_path=args.save)
 
     elif args.cmd == "eval":
-        meta = GNNMetaLearner(hidden_dim=args.hidden, num_gnn_layers=args.layers)
-        meta.load_state_dict(torch.load(args.checkpoint,
-                                        map_location=args.device))
+        # Load the checkpoint dictionary
+        ckpt = torch.load(args.checkpoint, map_location=args.device)
+        
+        # Extract config, using args as a fallback for older checkpoints
+        config = ckpt.get('config', {})
+        
+        hidden = config.get('hidden_dim', args.hidden)
+        layers = config.get('num_gnn_layers', args.layers)
+        u_lr = config.get('update_lr', 0.01) # Default to 0.01 if missing
+        w_clip = config.get('weight_clip', None)
+        b_clip = config.get('bias_clip', None)
+
+        # Initialize model with the SAVED settings, not just CLI defaults
+        meta = GNNMetaLearner(
+            hidden_dim=hidden, 
+            num_gnn_layers=layers,
+            update_lr=u_lr,
+            weight_clip=w_clip,
+            bias_clip=b_clip
+        )
+        
+        # Load weights
+        meta.load_state_dict(ckpt['state_dict'] if 'state_dict' in ckpt else ckpt)
+        
         results = evaluate(meta, args.problems,
                            steps=args.steps, device=args.device)
         _print_summary(results)
