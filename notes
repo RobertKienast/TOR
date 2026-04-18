@@ -1,0 +1,22 @@
+1.01
+DIfference between 
+
+* g
+
+* gnut (seems to be a bit better)
+
+none (kinda same  a bit better than * g)
+
+
+1.02
+
+============================================================
+  Summary (final loss ↓ is better)
+  Problem                       GNN        SGD       Adam
+  ----------------------------------------------------
+  quadratic_test            15.6241    -9.1264    -3.4159  [SGD]
+  lasso_test                10.0923     2.4983     2.5714  [SGD]
+  rastrigin_test           683.2857   595.4667   286.9049  [Adam]
+  mnist_test                 2.3891     2.1493     0.4573  [Adam]
+(venv) PS C:\Users\robki\Downloads\files> 
+beta - 0.2

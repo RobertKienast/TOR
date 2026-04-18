@@ -257,7 +257,7 @@ class GNNMetaLearner(nn.Module):
         )
         self.output_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2), nn.SiLU(),
-            nn.Linear(hidden_dim // 2, 1), nn.Tanh(),
+            nn.Linear(hidden_dim // 2, 2),
         )
 
     def forward(self,
@@ -271,18 +271,22 @@ class GNNMetaLearner(nn.Module):
 
         Returns
         -------
-        deltas : (N,) — one scalar per parameter node
+        deltas : (N, 2) — two scalars per parameter node
         """
         h = self.input_proj(node_feats)
         for layer in self.gnn:
             h = layer(h, edge_index)
-        return self.output_head(h).squeeze(-1)
+        raw_out = self.output_head(h)
+        delta = torch.tanh(raw_out[:, 0])
+        momentum_coeff = torch.sigmoid(raw_out[:, 1])
+        return delta, momentum_coeff
 
     # ── differentiable inner step (for meta-training) ─────────────────────
 
     def inner_step(self,
                    optimizee: Optimizee,
-                   step: int = 0) -> torch.Tensor:
+                   step: int = 0,
+                   momentum_buffers: Optional[list] = None) -> torch.Tensor:
         """
         Compute pre-update loss, get gradients, run GNN, apply update.
 
@@ -309,20 +313,32 @@ class GNNMetaLearner(nn.Module):
             return pre_loss.detach()
 
         # GNN forward — this is differentiable w.r.t. GNN weights
-        deltas = self(node_feats, edge_index)       # (N,) with grad_fn
+        deltas, momentum_coeffs = self(node_feats, edge_index)       # (N, 2) with grad_fn
+        
+        new_buffers = []
 
         # Step 4: apply param update using detached delta (in-place safe)
         with torch.no_grad():
-            for node, delta in zip(nodes, deltas):
+            for node, delta, momentum_coeff in zip(nodes, deltas, momentum_coeffs):
                 # Apply update
                 g = node.grad
-                g_norm = g.norm() + 1e-8
-                g_unit = g / g_norm
+                if momentum_buffers is None or node not in momentum_buffers:
+                    m_prev = torch.zeros_like(g)
+                else:
+                    m_prev = momentum_buffers[node]
+                
+                beta = 0.9
+                # Update rule: m_new = beta * m_prev + (1 - beta) * grad
+                m_new = beta * m_prev + (1.0 - beta) * g
+                new_buffers.append(m_new)
+
+                
+                m_unit = m_new / (m_new.norm() + 1e-8)
                 node.param.data.add_(
-                    delta.item() * self.update_lr * g_unit
+                    delta.item() * self.update_lr * m_unit
                 )
 
-                # Apply clipping
+                # Clipping logic
                 clip_val = self.bias_clip if node.is_bias else self.weight_clip
                 if clip_val is not None:
                     node.param.data.clamp_(-clip_val, clip_val)
@@ -342,39 +358,61 @@ class GNNMetaLearner(nn.Module):
             + alpha * deltas.pow(2).mean()
         )
 
-        return surrogate
+        return surrogate, new_buffers
 
     # ── evaluation step (no meta-gradient needed) ────────────────────────
 
-    def eval_step(self, optimizee: Optimizee, step: int = 0) -> float:
+    def eval_step(self, optimizee: Optimizee, step: int = 0, buffers: Optional[Dict] = None) -> Tuple[float, Dict]:
         """
-        Run one GNN-guided update on the optimizee.
-        No meta-gradients are accumulated; GNN weights are frozen.
-        Returns the pre-update loss value.
+        Run one GNN-guided update on the optimizee with stateful momentum.
+        'buffers' should be a dict mapping param_id to its momentum tensor.
         """
-        # Compute gradients on the optimizee (requires autograd)
+        if buffers is None:
+            buffers = {}
+
+        # 1. Compute gradients
         optimizee.zero_grad()
         loss = optimizee.loss()
         loss.backward()
         loss_val = loss.item()
 
+        # 2. Extract graph and features
         nodes, node_feats, edge_index = build_graph(optimizee, step)
         if not nodes:
-            return loss_val
+            return loss_val, buffers
 
-        # GNN forward — no grad needed for GNN weights during eval
+        # 3. GNN Forward
         with torch.no_grad():
-            deltas = self(node_feats, edge_index)   # (N,)
+            deltas, m_betas = self(node_feats, edge_index)
 
-        for node, delta in zip(nodes, deltas):
-            g = node.grad
-            g_norm = g.norm() + 1e-8
-            g_unit = g / g_norm
-            node.param.data.add_(
-                delta.item() * self.update_lr * g_unit
-            )
-        return loss_val
+        # 4. Apply Updates
+        with torch.no_grad():
+            for i, (node, delta, beta) in enumerate(zip(nodes, deltas, m_betas)):
+                # We use the python object ID or the param itself as a key
+                param_id = id(node.param)
+                g = node.grad
+                
+                # Retrieve or initialize state
+                m_prev = buffers.get(param_id, torch.zeros_like(g))
+                
+                # Update momentum: m = beta * m + (1-beta) * grad
+                m_new = beta * m_prev + (1.0 - beta) * g
+                buffers[param_id] = m_new  # Save for next step
+                
+                # Compute update direction
+                m_unit = m_new / (m_new.norm() + 1e-8)
+                
+                # Update parameter
+                node.param.data.add_(
+                    delta.item() * self.update_lr * m_unit
+                )
 
+                # Optional clipping
+                clip_val = self.bias_clip if node.is_bias else self.weight_clip
+                if clip_val is not None:
+                    node.param.data.clamp_(-clip_val, clip_val)
+
+        return loss_val, buffers
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Open-L2O Meta-Training
@@ -423,9 +461,9 @@ def meta_train(
 
         meta_opt.zero_grad()
         meta_loss = torch.tensor(0.0, device=device)
-
+        momentum_buffers = None
         for t in range(unroll):
-            loss_t = meta.inner_step(prob, step=t)
+            loss_t, momentum_buffers = meta.inner_step(prob, step=t, momentum_buffers=momentum_buffers)
             # Weight later losses more (curriculum style)
             weight = (t + 1) / unroll
             meta_loss = meta_loss + weight * loss_t
@@ -483,9 +521,10 @@ def evaluate(
             prob = make_problem(pname, device=device)
             prob.reset(seed=seed)
             gnn_losses = []
+            eval_buffers = None
             for t in range(steps):
-                l = meta.eval_step(prob, step=t)
-                gnn_losses.append(l)
+                l_val, eval_buffers = meta.eval_step(prob, step=t, buffers=eval_buffers)
+                gnn_losses.append(l_val)
             gnn_curves.append(gnn_losses)
 
             # ── SGD baseline ───────────────────────────────────────────────
