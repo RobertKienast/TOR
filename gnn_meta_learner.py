@@ -476,7 +476,7 @@ def meta_train(
     meta_lr: float = 1e-3,
     device: str = "cpu",
     save_path: Optional[str] = None,
-    log_every: int = 10,
+    log_every: int = 5,
     seed: Optional[int] = 0,
 ) -> List[float]:
     """
@@ -506,13 +506,16 @@ def meta_train(
     print(f"\n{'='*60}")
     print(f"  Open-L2O Meta-Training")
     print(f"  Problems : {problem_names}")
+    print(f"  Problem instances created: {len(problems)}")
     print(f"  Epochs   : {epochs}  |  Unroll : {unroll}")
     print(f"  GNN params: {sum(p.numel() for p in meta.parameters()):,}")
     print(f"{'='*60}\n")
 
     for epoch in range(1, epochs + 1):
         # Cycle through problems
-        prob = problems[(epoch - 1) % len(problems)]
+        prob_idx = (epoch - 1) % len(problems)
+        prob = problems[prob_idx]
+        prob_name = problem_names[prob_idx]
         # Randomize optimizee seed each epoch (reproducible if --seed is fixed).
         if seed is None:
             prob.reset(seed=None)
@@ -573,7 +576,7 @@ def meta_train(
             print(f"  Epoch {epoch:4d}/{epochs} | "
                   f"meta-loss = {epoch_total_loss:.4f} | "
                   f"ema = {ema_loss:.4f} | "
-                  f"problem = {problem_names[(epoch-1) % len(problem_names)]}")
+                  f"problem = {prob_name}")
 
     # Inside meta_train function (gnn_meta_learner.py)
     if save_path:
