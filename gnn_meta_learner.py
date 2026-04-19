@@ -542,7 +542,7 @@ def meta_train(
             )
             if first_loss is None:
                 first_loss = loss_t.detach().clamp(min=1e-8)
-            weight = (t + 1) / unroll
+            weight = math.exp(-0.1 * t)
             meta_loss = meta_loss + weight * (loss_t / (first_loss  + 1e-8))
             epoch_total_loss += loss_t.detach().item()
 

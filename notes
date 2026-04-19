@@ -32,3 +32,10 @@ beta - 0.2
   lasso_test                10.0679     2.4983     2.5714  [SGD]
   rastrigin_test           135.4633   595.4667   286.9049  [✓GNN]
   mnist_test                 2.3888     2.1493     0.4573  [Adam]
+
+ver 1.03 or 1.04 added GATv2 instead of normal edge predictor as it didn't have the depth to do mnist.
+
+
+  ver 1.045 can beat quadratic, lasso, rastrigin, mnist but not trained together but indivudally
+  fails to beat mnist conv and cifar conv, make changes for better cnn
+  
