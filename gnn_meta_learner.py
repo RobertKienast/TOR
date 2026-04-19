@@ -136,29 +136,33 @@ def build_graph(self, params: List[torch.Tensor]):
     edge_index = torch.tensor(edge_list, dtype=torch.long).t()
     return nodes, edge_index
 
-
 def build_edges(nodes: List[ParamNode]) -> torch.Tensor:
-    """Build fully-connected intra-layer edges from ParamNode layer indices."""
-    if not nodes:
-        return torch.zeros(2, 0, dtype=torch.long)
-
+    """Intra-layer + sequential inter-layer edges."""
     device = nodes[0].param.device
     layer_buckets: Dict[int, List[int]] = {}
     for i, n in enumerate(nodes):
         layer_buckets.setdefault(n.layer_idx, []).append(i)
 
-    edges: List[Tuple[int, int]] = []
+    edges = []
+    sorted_layers = sorted(layer_buckets.keys())
+    
+    # Intra-layer (existing)
     for ids in layer_buckets.values():
         for i in ids:
             for j in ids:
                 if i != j:
                     edges.append((i, j))
+    
+    # Inter-layer: connect adjacent layers bidirectionally
+    for k in range(len(sorted_layers) - 1):
+        for src in layer_buckets[sorted_layers[k]]:
+            for dst in layer_buckets[sorted_layers[k + 1]]:
+                edges.append((src, dst))
+                edges.append((dst, src))
 
     if not edges:
         return torch.zeros(2, 0, dtype=torch.long, device=device)
-
     return torch.tensor(edges, dtype=torch.long, device=device).t().contiguous()
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GNN building blocks
@@ -173,15 +177,16 @@ class GATv2MetaLayer(nn.Module):
         self.conv = GATv2Conv(in_dim, out_dim // heads, heads=heads, concat=True)
         self.norm = nn.LayerNorm(out_dim)
         self.act = nn.SiLU()
+        self.res_proj = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
 
     def forward(self, h, edge_index):
         # h: (N, in_dim), edge_index: (2, E)
-        res = h
+        res = self.res_proj(h)
         h = self.conv(h, edge_index)
-        h = self.norm(h)
+        h = self.norm(h+res)
         h = self.act(h)
         # Assuming in_dim == out_dim for a residual connection
-        return h 
+        return h
     
 class EdgeNet(nn.Module):
     def __init__(self, in_dim: int, out_dim: int):
@@ -516,6 +521,7 @@ def meta_train(
         momentum_buffers = {}
         t_trunc = 10  # Truncate every 10 steps
         epoch_total_loss = 0.0
+        first_loss = None
         for t in range(unroll):
             loss_t, params, momentum_buffers = meta.inner_step(
                 prob,
@@ -523,8 +529,10 @@ def meta_train(
                 step=t,
                 momentum_buffers=momentum_buffers
             )
+            if first_loss is None:
+                first_loss = loss_t.detach().clamp(min=1e-8)
             weight = (t + 1) / unroll
-            meta_loss = meta_loss + weight * loss_t
+            meta_loss = meta_loss + weight * (loss_t / (first_loss  + 1e-8))
             epoch_total_loss += loss_t.detach().item()
 
             # Perform a meta-update every t_trunc steps
