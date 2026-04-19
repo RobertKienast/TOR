@@ -498,6 +498,8 @@ def meta_train(
     """
     meta = meta.to(device)
     meta_opt = torch.optim.Adam(meta.parameters(), lr=meta_lr)
+    meta_opt = torch.optim.Adam(meta.parameters(), lr=meta_lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(meta_opt, T_max=epochs, eta_min=meta_lr * 0.01)
     history = []
     ema_loss = None
 
@@ -530,7 +532,7 @@ def meta_train(
         meta_loss = torch.tensor(0.0, device=device)
         params = prob.params()
         momentum_buffers = {}
-        t_trunc = 10  # Truncate every 10 steps
+        t_trunc = max(2, min(10, 2 + epoch // (epochs // 8)))
         epoch_total_loss = 0.0
         first_loss = None
         for t in range(unroll):
@@ -560,8 +562,11 @@ def meta_train(
                     k: v.detach().requires_grad_(True)
                     for k, v in params.items()
                 }
-                for k in momentum_buffers:
-                    momentum_buffers[k] = momentum_buffers[k].detach()
+                momentum_buffers = {
+                    k: v.detach() for k, v in momentum_buffers.items()
+                }
+                # params detach is correct and stays as-is
+                params = {k: v.detach().requires_grad_(True) for k, v in params.items()}
 
         # Flush remainder if unroll is not divisible by t_trunc.
         if unroll % t_trunc != 0:
@@ -577,7 +582,7 @@ def meta_train(
         # nn.utils.clip_grad_norm_(meta.parameters(), max_norm=1.0)
         # meta_opt.step()
 
-            
+        scheduler.step()
 
         if epoch % log_every == 0 or epoch == 1:
             print(f"  Epoch {epoch:4d}/{epochs} | "
