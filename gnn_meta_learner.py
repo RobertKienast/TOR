@@ -53,7 +53,7 @@ from open_l2o_problems import make_problem, Optimizee, TRAIN_PROBLEMS, TEST_PROB
 # Graph extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
-NODE_DIM = 13   # feature vector dimensionality per parameter-node
+NODE_DIM = 18   # feature vector dimensionality per parameter-node
 
 
 class ParamNode:
@@ -70,43 +70,94 @@ class ParamNode:
         self.layer_idx = layer_idx
         self.is_bias = is_bias
     def features(self, step: int, n_layers: int) -> torch.Tensor:
-        w = self.param.data.float().flatten()
-        g = self.grad.float().flatten()
+        p = self.param.data.float()
+        g = self.grad.float()
 
-        w_norm = w.norm(2)
-        g_norm = g.norm(2)
-        w_log_norm = torch.log(w_norm + 1e-6)
-        g_log_norm = torch.log(g_norm + 1e-6)
+        # For conv (4D) or linear (2D): treat dim-0 as the "filter" dimension
+        # For bias (1D): treat as single filter
+        if p.dim() >= 2:
+            # Reshape to (num_filters, -1)
+            p_filters = p.flatten(1)   # (F, *)
+            g_filters = g.flatten(1)
+        else:
+            p_filters = p.unsqueeze(0)  # (1, *)
+            g_filters = g.unsqueeze(0)
 
-        g_mean_norm = g.mean() / (g_norm + 1e-8)
-        g_std_norm  = g.std()  / (g_norm + 1e-8)
-        w_mean_norm = w.mean() / (w_norm + 1e-8)
-        w_std_norm  = w.std()  / (w_norm + 1e-8)
+        # Per-filter norms then aggregate ACROSS filters
+        g_filter_norms = torch.nan_to_num(g_filters.norm(2, dim=1), nan=0.0, posinf=1e6, neginf=0.0)       # (F,)
+        p_filter_norms = torch.nan_to_num(p_filters.norm(2, dim=1), nan=0.0, posinf=1e6, neginf=0.0)       # (F,)
 
-        # New features
-        snr             = g.abs().mean() / (g.std() + 1e-8)
-        sign_consistency = g.sign().mean().abs()
-        w_to_g_ratio    = torch.log((w_norm + 1e-8) / (g_norm + 1e-8))
-        g_centered      = (g - g.mean()) / (g.std() + 1e-8)
-        kurtosis        = (g_centered.pow(4).mean() - 3.0).clamp(-10, 10) / 10.0
-        ndim_encoded    = torch.tensor(self.param.dim() / 4.0, dtype=torch.float32)
+        # How much do filters disagree in gradient magnitude? (coefficient of variation)
+        # Clamp to prevent overflow when std is large
+        if g_filter_norms.numel() > 1:
+            g_norm_mean = g_filter_norms.mean()
+            g_norm_std = g_filter_norms.std()
+            g_norm_cv = torch.clamp(g_norm_std / (g_norm_mean + 1e-8), max=100)
+        else:
+            g_norm_cv = torch.tensor(0.0, device=g.device, dtype=g.dtype)
+            
+        if p_filter_norms.numel() > 1:
+            p_norm_mean = p_filter_norms.mean()
+            p_norm_std = p_filter_norms.std()
+            p_norm_cv = torch.clamp(p_norm_std / (p_norm_mean + 1e-8), max=100)
+        else:
+            p_norm_cv = torch.tensor(0.0, device=g.device, dtype=g.dtype)
 
-        return torch.stack([
-            w_log_norm,
-            g_log_norm,
-            w_mean_norm,
-            g_mean_norm,
-            w_std_norm,
-            g_std_norm,
-            torch.tensor(math.log1p(step), dtype=torch.float32),
-            torch.tensor(self.layer_idx / max(n_layers - 1, 1), dtype=torch.float32),
-            # New
-            snr,
-            sign_consistency,
-            w_to_g_ratio,
-            kurtosis,
-            ndim_encoded,
-        ]).to(self.param.device)
+        # Fraction of filters with near-zero gradient (dead filters)
+        dead_filter_frac = (g_filter_norms < 1e-4).float().mean()
+
+        # Max filter norm / mean filter norm — detects dominant filters, clamp to prevent overflow
+        if g_filter_norms.numel() > 1:
+            g_norm_max_ratio = torch.clamp(g_filter_norms.max() / (g_filter_norms.mean() + 1e-8), max=100)
+        else:
+            g_norm_max_ratio = torch.tensor(0.0, device=g.device, dtype=g.dtype)
+
+        # Existing scalar features on full flattened tensor
+        w = p.flatten()
+        g_flat = g.flatten()
+        w_norm = torch.nan_to_num(w.norm(2), nan=0.0, posinf=1e6, neginf=0.0)
+        g_norm = torch.nan_to_num(g_flat.norm(2), nan=0.0, posinf=1e6, neginf=0.0)
+
+        w_log_norm       = torch.log(w_norm + 1e-6)
+        g_log_norm       = torch.log(g_norm + 1e-6)
+        g_mean_norm      = g_flat.mean() / (g_norm + 1e-8)
+        g_std_norm       = g_flat.std()  / (g_norm + 1e-8)
+        w_mean_norm      = w.mean()      / (w_norm + 1e-8)
+        w_std_norm       = w.std()       / (w_norm + 1e-8)
+        snr              = g_flat.abs().mean() / (g_flat.std() + 1e-8)
+        sign_consistency = g_flat.sign().mean().abs()
+        w_to_g_ratio     = torch.log((w_norm + 1e-8) / (g_norm + 1e-8))
+        
+        # Normalize gradient before computing kurtosis to prevent pow(4) overflow
+        g_std = g_flat.std() + 1e-8
+        g_centered       = (g_flat - g_flat.mean()) / g_std
+        # Clamp before pow(4) to prevent overflow on large values
+        g_centered_clipped = torch.clamp(g_centered, min=-10, max=10)
+        kurtosis         = (g_centered_clipped.pow(4).mean() - 3.0).clamp(-10, 10) / 10.0
+        ndim_encoded     = torch.tensor(p.dim() / 4.0, dtype=torch.float32, device=g.device)
+        if self.param.dim() == 4:
+            kH, kW = self.param.shape[2], self.param.shape[3]
+            spatial_size = torch.tensor(math.log(kH * kW + 1) / math.log(10), dtype=torch.float32)
+        else:
+            spatial_size = torch.tensor(0.0, dtype=torch.float32)
+        # Ensure all features match device and dtype, and are finite
+        features = torch.stack([
+            w_log_norm, g_log_norm,
+            w_mean_norm, g_mean_norm,
+            w_std_norm, g_std_norm,
+            torch.tensor(math.log1p(step), dtype=torch.float32, device=g.device),
+            torch.tensor(self.layer_idx / max(n_layers - 1, 1), dtype=torch.float32, device=g.device),
+            snr, sign_consistency, w_to_g_ratio, kurtosis, ndim_encoded,
+            # New conv-aware features
+            g_norm_cv, p_norm_cv,
+            dead_filter_frac,
+            g_norm_max_ratio.clamp(max=20) / 20.0,
+            spatial_size,
+        ])
+        
+        # Final safeguard: replace any NaN/Inf with zero
+        features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+        return features.to(self.param.device)
 
 def build_graph(self, params: List[torch.Tensor]):
     nodes = []
@@ -349,6 +400,10 @@ class GNNMetaLearner(nn.Module):
             create_graph=True  # CRITICAL for meta-learning
         )
         grads = dict(zip(params.keys(), grads))
+        grads = {
+            k: torch.nan_to_num(v, nan=0.0, posinf=1e3, neginf=-1e3)
+            for k, v in grads.items()
+        }
 
 
 
@@ -361,42 +416,64 @@ class GNNMetaLearner(nn.Module):
         node_feats = torch.stack([
             n.features(step, len(nodes)) for n in nodes
         ])
+        node_feats = torch.nan_to_num(node_feats, nan=0.0, posinf=1e3, neginf=-1e3)
 
         edge_index = build_edges(nodes).to(node_feats.device)
 
         # GNN forward — this is differentiable w.r.t. GNN weights
-        deltas, momentum_coeff, step_size = self(node_feats, edge_index)       # (N, 2) with grad_fn
+        deltas, momentum_coeff, step_size = self(node_feats, edge_index)
 
+        # Safeguard: clamp GNN outputs to prevent extreme values
+        deltas = torch.nan_to_num(deltas, nan=0.0, posinf=0.0, neginf=0.0)
+        momentum_coeff = torch.nan_to_num(momentum_coeff, nan=0.5, posinf=1.0, neginf=0.0)
+        step_size = torch.nan_to_num(step_size, nan=1e-3, posinf=1.0, neginf=1e-3)
+        deltas = torch.clamp(deltas, min=-1.0, max=1.0)
+        momentum_coeff = torch.clamp(momentum_coeff, min=0.0, max=1.0)
+        step_size = torch.clamp(step_size, min=1e-4, max=10.0)
 
         new_params = {}
         new_momentum_buffers = {}
 
+       # In inner_step and eval_step, replace the update block:
+
         for i, node in enumerate(nodes):
             name = node.name
             p = params[name]
-            g = grads[name]
+            g = torch.nan_to_num(grads[name], nan=0.0, posinf=1e3, neginf=-1e3)
+
+            # Compute per-filter scale factors
+            if p.dim() >= 2:
+                g_f = g.flatten(1)                          # (F, *)
+                filter_norms = g_f.norm(2, dim=1).clamp(min=1e-8)  # (F,)
+                # Normalise each filter's gradient independently
+                g_normalised = (g_f / filter_norms.unsqueeze(1)).view_as(g)
+            else:
+                g_normalised = g / (g.norm() + 1e-8)
+            g_normalised = torch.nan_to_num(g_normalised, nan=0.0, posinf=1.0, neginf=-1.0)
 
             m_prev = momentum_buffers.get(name, torch.zeros_like(g))
-
             beta = momentum_coeff[i]
-            m_new = beta * m_prev + (1 - beta) * g
+            m_new = beta * m_prev + (1 - beta) * g_normalised  # momentum on normalised grad
+            m_new = torch.nan_to_num(m_new, nan=0.0, posinf=1e3, neginf=-1e3)
 
-            # Stability tweak: RMS-normalize momentum instead of strict unit-norm direction.
             m_rms = m_new.pow(2).mean().sqrt().clamp(min=1e-8)
             m_unit = m_new / (m_rms + 1e-8)
 
             update = step_size[i] * deltas[i] * self.update_lr * m_unit
-            # Cap per-node RMS update magnitude to suppress rare destabilizing jumps.
             upd_rms = update.pow(2).mean().sqrt().clamp(min=1e-8)
             update = update * (0.1 / (upd_rms + 1e-8)).clamp(max=1.0)
 
-            # 🔥 THIS IS THE IMPORTANT LINE
-            new_params[name] = p + update
-
+            p_next = p + update
+            new_params[name] = torch.nan_to_num(p_next, nan=0.0, posinf=1e3, neginf=-1e3)
             new_momentum_buffers[name] = m_new
 
         # ---- 5. Compute next loss (connected graph!) ----
         next_loss = optimizee.loss(new_params)
+        next_loss = torch.where(
+            torch.isfinite(next_loss),
+            next_loss,
+            torch.full_like(next_loss, 1e3)
+        )
 
         return next_loss, new_params, new_momentum_buffers
 
@@ -421,6 +498,10 @@ class GNNMetaLearner(nn.Module):
         loss = optimizee.loss(params)
         grads = torch.autograd.grad(loss, params.values(), create_graph=False)
         grads = dict(zip(params.keys(), grads))
+        grads = {
+            k: torch.nan_to_num(v, nan=0.0, posinf=1e3, neginf=-1e3)
+            for k, v in grads.items()
+        }
 
         # 2. Build graph/features from provided params and grads
         nodes = []
@@ -437,6 +518,9 @@ class GNNMetaLearner(nn.Module):
         # 3. GNN Forward
         with torch.no_grad():
             deltas, momentum_coeff, step_size = self(node_feats, edge_index)
+            deltas = torch.nan_to_num(deltas, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1.0, 1.0)
+            momentum_coeff = torch.nan_to_num(momentum_coeff, nan=0.5, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+            step_size = torch.nan_to_num(step_size, nan=1e-3, posinf=1.0, neginf=1e-3).clamp(1e-4, 10.0)
 
         # 4. Build new params dictionary (functional, no in-place writes)
         new_params: Dict[str, torch.Tensor] = {}
@@ -444,10 +528,11 @@ class GNNMetaLearner(nn.Module):
             for node, delta, beta, step_scale in zip(nodes, deltas, momentum_coeff, step_size):
                 name = node.name
                 p = params[name]
-                g = grads[name]
+                g = torch.nan_to_num(grads[name], nan=0.0, posinf=1e3, neginf=-1e3)
 
                 m_prev = buffers.get(name, torch.zeros_like(g))
                 m_new = beta * m_prev + (1.0 - beta) * g
+                m_new = torch.nan_to_num(m_new, nan=0.0, posinf=1e3, neginf=-1e3)
                 buffers[name] = m_new
 
                 m_rms = m_new.pow(2).mean().sqrt().clamp(min=1e-8)
@@ -456,7 +541,8 @@ class GNNMetaLearner(nn.Module):
                 update = step_scale * delta * self.update_lr * m_unit
                 upd_rms = update.pow(2).mean().sqrt().clamp(min=1e-8)
                 update = update * (0.1 / (upd_rms + 1e-8)).clamp(max=1.0)
-                p_new = p + update
+                update = torch.nan_to_num(update, nan=0.0, posinf=0.0, neginf=0.0)
+                p_new = torch.nan_to_num(p + update, nan=0.0, posinf=1e3, neginf=-1e3)
 
                 clip_val = self.bias_clip if node.is_bias else self.weight_clip
                 if clip_val is not None:
@@ -466,6 +552,11 @@ class GNNMetaLearner(nn.Module):
                 new_params[name] = p_new.detach().requires_grad_(True)
 
         next_loss = optimizee.loss(new_params)
+        next_loss = torch.where(
+            torch.isfinite(next_loss),
+            next_loss,
+            torch.full_like(next_loss, 1e3)
+        )
         return next_loss.item(), new_params, buffers
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -497,7 +588,6 @@ def meta_train(
     Returns list of per-epoch meta-losses.
     """
     meta = meta.to(device)
-    meta_opt = torch.optim.Adam(meta.parameters(), lr=meta_lr)
     meta_opt = torch.optim.Adam(meta.parameters(), lr=meta_lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(meta_opt, T_max=epochs, eta_min=meta_lr * 0.01)
     history = []
@@ -542,15 +632,22 @@ def meta_train(
                 step=t,
                 momentum_buffers=momentum_buffers
             )
+            if not torch.isfinite(loss_t).item():
+                print(f"  [warn] non-finite inner loss at epoch={epoch} step={t} problem={prob_name}")
+            loss_t = torch.nan_to_num(loss_t, nan=1e3, posinf=1e3, neginf=1e3)
             if first_loss is None:
                 first_loss = loss_t.detach().clamp(min=1e-8)
             weight = math.exp(-0.1 * t)
             meta_loss = meta_loss + weight * (loss_t / (first_loss  + 1e-8))
+            meta_loss = torch.nan_to_num(meta_loss, nan=1e3, posinf=1e3, neginf=1e3)
             epoch_total_loss += loss_t.detach().item()
 
             # Perform a meta-update every t_trunc steps
             if (t + 1) % t_trunc == 0:
                 meta_loss.backward()
+                for p in meta.parameters():
+                    if p.grad is not None:
+                        p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=1.0, neginf=-1.0)
                 nn.utils.clip_grad_norm_(meta.parameters(), max_norm=1.0)
                 meta_opt.step()
                 meta_opt.zero_grad()
@@ -565,12 +662,13 @@ def meta_train(
                 momentum_buffers = {
                     k: v.detach() for k, v in momentum_buffers.items()
                 }
-                # params detach is correct and stays as-is
-                params = {k: v.detach().requires_grad_(True) for k, v in params.items()}
 
         # Flush remainder if unroll is not divisible by t_trunc.
         if unroll % t_trunc != 0:
             meta_loss.backward()
+            for p in meta.parameters():
+                if p.grad is not None:
+                    p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=1.0, neginf=-1.0)
             nn.utils.clip_grad_norm_(meta.parameters(), max_norm=1.0)
             meta_opt.step()
             meta_opt.zero_grad()
