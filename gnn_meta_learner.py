@@ -53,7 +53,7 @@ from open_l2o_problems import make_problem, Optimizee, TRAIN_PROBLEMS, TEST_PROB
 # Graph extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
-NODE_DIM = 8   # feature vector dimensionality per parameter-node
+NODE_DIM = 13   # feature vector dimensionality per parameter-node
 
 
 class ParamNode:
@@ -72,21 +72,24 @@ class ParamNode:
     def features(self, step: int, n_layers: int) -> torch.Tensor:
         w = self.param.data.float().flatten()
         g = self.grad.float().flatten()
-        
-        # 1. Use log-scaling for the magnitudes
-        # Adding a small epsilon (1e-6) prevents log(0) errors
+
         w_norm = w.norm(2)
         g_norm = g.norm(2)
         w_log_norm = torch.log(w_norm + 1e-6)
         g_log_norm = torch.log(g_norm + 1e-6)
-        
-        # 2. Normalize the distribution stats by the norm
-        # This makes the features scale-invariant
-        g_mean_norm = (g.mean() + 1e-6) / (g_norm + 1e-6)
-        g_std_norm = (g.std() + 1e-6) / (g_norm + 1e-6)
-        
-        w_mean_norm = (w.mean() + 1e-6) / (w_norm + 1e-6)
-        w_std_norm = (w.std() + 1e-6) / (w_norm + 1e-6)
+
+        g_mean_norm = g.mean() / (g_norm + 1e-8)
+        g_std_norm  = g.std()  / (g_norm + 1e-8)
+        w_mean_norm = w.mean() / (w_norm + 1e-8)
+        w_std_norm  = w.std()  / (w_norm + 1e-8)
+
+        # New features
+        snr             = g.abs().mean() / (g.std() + 1e-8)
+        sign_consistency = g.sign().mean().abs()
+        w_to_g_ratio    = torch.log((w_norm + 1e-8) / (g_norm + 1e-8))
+        g_centered      = (g - g.mean()) / (g.std() + 1e-8)
+        kurtosis        = (g_centered.pow(4).mean() - 3.0).clamp(-10, 10) / 10.0
+        ndim_encoded    = torch.tensor(self.param.dim() / 4.0, dtype=torch.float32)
 
         return torch.stack([
             w_log_norm,
@@ -97,7 +100,14 @@ class ParamNode:
             g_std_norm,
             torch.tensor(math.log1p(step), dtype=torch.float32),
             torch.tensor(self.layer_idx / max(n_layers - 1, 1), dtype=torch.float32),
+            # New
+            snr,
+            sign_consistency,
+            w_to_g_ratio,
+            kurtosis,
+            ndim_encoded,
         ]).to(self.param.device)
+
 def build_graph(self, params: List[torch.Tensor]):
     nodes = []
     layer_node_ids = [] # Track which IDs belong to which layer
@@ -222,13 +232,13 @@ class GNNLayer(nn.Module):
 
     def forward(self, h: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         N, device = h.size(0), h.device
-
         if edge_index.size(1) == 0:
-            return self.node_net(h, torch.zeros(N, self.hidden_dim, device=device))
-
-        # GATv2 produces one message-aggregated representation per node.
-        agg = self.edge_net(h, edge_index)  # (N, hidden_dim)
-        return self.node_net(h, agg)
+            agg = torch.zeros(N, self.hidden_dim, device=device)
+        else:
+            agg = self.edge_net(h, edge_index)  # (N, hidden_dim)
+        
+        updated = self.node_net(h, agg)         # (N, hidden_dim)
+        return h + updated            
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -300,7 +310,8 @@ class GNNMetaLearner(nn.Module):
         raw_out = self.output_head(h)
         delta = torch.tanh(raw_out[:, 0])
         momentum_coeff = torch.sigmoid(raw_out[:, 1])
-        step_size = torch.sigmoid(raw_out[:, 2])
+        log_lr = raw_out[:, 2]  # learned log step size, unconstrained
+        step_size = torch.exp(log_lr.clamp(-6, 0))
         return delta, momentum_coeff, step_size
 
     # ── differentiable inner step (for meta-training) ─────────────────────
