@@ -53,7 +53,7 @@ from open_l2o_problems import make_problem, Optimizee, TRAIN_PROBLEMS, TEST_PROB
 # Graph extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
-NODE_DIM = 18   # feature vector dimensionality per parameter-node
+NODE_DIM = 5   # feature vector dimensionality per parameter-node
 
 
 class ParamNode:
@@ -70,8 +70,8 @@ class ParamNode:
         self.layer_idx = layer_idx
         self.is_bias = is_bias
     def features(self, step: int, n_layers: int) -> torch.Tensor:
-        p = self.param.data.float()
-        g = self.grad.float()
+        p = self.param.detach().float()  # explicit — makes intent clear
+        g = self.grad.to(torch.float32)
 
         # For conv (4D) or linear (2D): treat dim-0 as the "filter" dimension
         # For bias (1D): treat as single filter
@@ -135,67 +135,29 @@ class ParamNode:
         g_centered_clipped = torch.clamp(g_centered, min=-10, max=10)
         kurtosis         = (g_centered_clipped.pow(4).mean() - 3.0).clamp(-10, 10) / 10.0
         ndim_encoded     = torch.tensor(p.dim() / 4.0, dtype=torch.float32, device=g.device)
-        if self.param.dim() == 4:
-            kH, kW = self.param.shape[2], self.param.shape[3]
-            spatial_size = torch.tensor(math.log(kH * kW + 1) / math.log(10), dtype=torch.float32)
+        if p.dim() == 4:
+            kH, kW = p.shape[2], p.shape[3]
+            spatial_size = torch.tensor(math.log(kH * kW + 1) / math.log(10), dtype=torch.float32, device=g.device)
         else:
-            spatial_size = torch.tensor(0.0, dtype=torch.float32)
+            spatial_size = torch.tensor(0.0, dtype=torch.float32, device=g.device)
         # Ensure all features match device and dtype, and are finite
         features = torch.stack([
             w_log_norm, g_log_norm,
-            w_mean_norm, g_mean_norm,
-            w_std_norm, g_std_norm,
-            torch.tensor(math.log1p(step), dtype=torch.float32, device=g.device),
-            torch.tensor(self.layer_idx / max(n_layers - 1, 1), dtype=torch.float32, device=g.device),
-            snr, sign_consistency, w_to_g_ratio, kurtosis, ndim_encoded,
+            #w_mean_norm, g_mean_norm,
+            #w_std_norm, g_std_norm,
+            #torch.tensor(math.log1p(step), dtype=torch.float32, device=g.device),
+            #torch.tensor(self.layer_idx / max(n_layers - 1, 1), dtype=torch.float32, device=g.device),
+            snr, sign_consistency, w_to_g_ratio, #kurtosis, ndim_encoded,
             # New conv-aware features
-            g_norm_cv, p_norm_cv,
-            dead_filter_frac,
-            g_norm_max_ratio.clamp(max=20) / 20.0,
-            spatial_size,
+            #g_norm_cv, p_norm_cv,
+            #dead_filter_frac,
+            #g_norm_max_ratio.clamp(max=20) / 20.0,
+            #spatial_size,
         ])
         
         # Final safeguard: replace any NaN/Inf with zero
         features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
         return features.to(self.param.device)
-
-def build_graph(self, params: List[torch.Tensor]):
-    nodes = []
-    layer_node_ids = [] # Track which IDs belong to which layer
-    current_id = 0
-    
-    # 1. Create nodes and track IDs per layer
-    for i, p in enumerate(params):
-        p_nodes = ParamNode(p, layer_idx=i)
-        nodes.append(p_nodes)
-        
-        # Store the range of IDs for this specific parameter/layer
-        num_params = p.numel()
-        layer_node_ids.append(list(range(current_id, current_id + num_params)))
-        current_id += num_params
-
-    # 2. Build Edges
-    edge_list = []
-    num_layers = len(layer_node_ids)
-    
-    for i in range(num_layers):
-        # --- Intra-layer edges (Current logic) ---
-        # Connect parameters within the same layer (e.g., Weight <-> Bias)
-        for src in layer_node_ids[i]:
-            for dst in layer_node_ids[i]:
-                if src != dst:
-                    edge_list.append([src, dst])
-        
-        # --- Inter-layer edges (New logic) ---
-        # Connect Layer i to Layer i + 1
-        if i < num_layers - 1:
-            for src in layer_node_ids[i]:
-                for dst in layer_node_ids[i+1]:
-                    edge_list.append([src, dst]) # Forward edge
-                    edge_list.append([dst, src]) # Backward edge
-
-    edge_index = torch.tensor(edge_list, dtype=torch.long).t()
-    return nodes, edge_index
 
 def build_edges(nodes: List[ParamNode]) -> torch.Tensor:
     """Intra-layer + sequential inter-layer edges."""
@@ -280,6 +242,7 @@ class GNNLayer(nn.Module):
         self.hidden_dim = hidden_dim
         self.edge_net = GATv2MetaLayer(node_dim, hidden_dim)
         self.node_net = NodeUpdateNet(node_dim, hidden_dim, hidden_dim)
+        self.res_proj = nn.Linear(node_dim, hidden_dim) if node_dim != hidden_dim else nn.Identity()
 
     def forward(self, h: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         N, device = h.size(0), h.device
@@ -287,9 +250,9 @@ class GNNLayer(nn.Module):
             agg = torch.zeros(N, self.hidden_dim, device=device)
         else:
             agg = self.edge_net(h, edge_index)  # (N, hidden_dim)
-        
-        updated = self.node_net(h, agg)         # (N, hidden_dim)
-        return h + updated            
+        res = self.res_proj(h)
+        updated = self.node_net(h, agg)
+        return res + updated            
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -371,7 +334,7 @@ class GNNMetaLearner(nn.Module):
                    optimizee: Optimizee,
                    params: Optional[Dict[str, torch.Tensor]] = None,
                    step: int = 0,
-                   momentum_buffers: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
+                   momentum_buffers: Optional[Dict[str, torch.Tensor]] = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """
         Compute pre-update loss, get gradients, run GNN, apply update.
 
@@ -397,15 +360,9 @@ class GNNMetaLearner(nn.Module):
         grads = torch.autograd.grad(
             loss,
             params.values(),
-            create_graph=True  # CRITICAL for meta-learning
+            create_graph=False  # CRITICAL for meta-learning
         )
         grads = dict(zip(params.keys(), grads))
-        grads = {
-            k: torch.nan_to_num(v, nan=0.0, posinf=1e3, neginf=-1e3)
-            for k, v in grads.items()
-        }
-
-
 
         # Step 3: build graph and run GNN (retains grad)
         nodes = []
@@ -416,17 +373,13 @@ class GNNMetaLearner(nn.Module):
         node_feats = torch.stack([
             n.features(step, len(nodes)) for n in nodes
         ])
-        node_feats = torch.nan_to_num(node_feats, nan=0.0, posinf=1e3, neginf=-1e3)
 
         edge_index = build_edges(nodes).to(node_feats.device)
 
         # GNN forward — this is differentiable w.r.t. GNN weights
         deltas, momentum_coeff, step_size = self(node_feats, edge_index)
 
-        # Safeguard: clamp GNN outputs to prevent extreme values
-        deltas = torch.nan_to_num(deltas, nan=0.0, posinf=0.0, neginf=0.0)
-        momentum_coeff = torch.nan_to_num(momentum_coeff, nan=0.5, posinf=1.0, neginf=0.0)
-        step_size = torch.nan_to_num(step_size, nan=1e-3, posinf=1.0, neginf=1e-3)
+        # Clamp GNN outputs to reasonable ranges (preserves grad_fn)
         deltas = torch.clamp(deltas, min=-1.0, max=1.0)
         momentum_coeff = torch.clamp(momentum_coeff, min=0.0, max=1.0)
         step_size = torch.clamp(step_size, min=1e-4, max=10.0)
@@ -434,46 +387,36 @@ class GNNMetaLearner(nn.Module):
         new_params = {}
         new_momentum_buffers = {}
 
-       # In inner_step and eval_step, replace the update block:
-
         for i, node in enumerate(nodes):
             name = node.name
             p = params[name]
-            g = torch.nan_to_num(grads[name], nan=0.0, posinf=1e3, neginf=-1e3)
-
-            # Compute per-filter scale factors
-            if p.dim() >= 2:
-                g_f = g.flatten(1)                          # (F, *)
-                filter_norms = g_f.norm(2, dim=1).clamp(min=1e-8)  # (F,)
-                # Normalise each filter's gradient independently
-                g_normalised = (g_f / filter_norms.unsqueeze(1)).view_as(g)
-            else:
-                g_normalised = g / (g.norm() + 1e-8)
-            g_normalised = torch.nan_to_num(g_normalised, nan=0.0, posinf=1.0, neginf=-1.0)
+            g = grads[name]
 
             m_prev = momentum_buffers.get(name, torch.zeros_like(g))
-            beta = momentum_coeff[i]
-            m_new = beta * m_prev + (1 - beta) * g_normalised  # momentum on normalised grad
-            m_new = torch.nan_to_num(m_new, nan=0.0, posinf=1e3, neginf=-1e3)
 
+            beta = momentum_coeff[i]
+            m_new = beta * m_prev + (1 - beta) * g
+
+            # Stability tweak: RMS-normalize momentum instead of strict unit-norm direction.
             m_rms = m_new.pow(2).mean().sqrt().clamp(min=1e-8)
             m_unit = m_new / (m_rms + 1e-8)
 
-            update = step_size[i] * deltas[i] * self.update_lr * m_unit
+            update = step_size[i] * deltas[i] * m_new
+            # Cap per-node RMS update magnitude to suppress rare destabilizing jumps.
+            p_rms = p.pow(2).mean().sqrt()
+            p_rms_safe = p_rms.clamp(min=1e-3, max=10.0)   # absolute floor — units of "typical weight scale"
             upd_rms = update.pow(2).mean().sqrt().clamp(min=1e-8)
-            update = update * (0.1 / (upd_rms + 1e-8)).clamp(max=1.0)
+            relative_scale = upd_rms / p_rms_safe
+            cap_ratio=0.5
+            update = update * (cap_ratio / relative_scale).clamp(max=1.0)
 
-            p_next = p + update
-            new_params[name] = torch.nan_to_num(p_next, nan=0.0, posinf=1e3, neginf=-1e3)
+            # 🔥 THIS IS THE IMPORTANT LINE - functional update
+            new_params[name] = p + update
+
             new_momentum_buffers[name] = m_new
 
         # ---- 5. Compute next loss (connected graph!) ----
         next_loss = optimizee.loss(new_params)
-        next_loss = torch.where(
-            torch.isfinite(next_loss),
-            next_loss,
-            torch.full_like(next_loss, 1e3)
-        )
 
         return next_loss, new_params, new_momentum_buffers
 
@@ -483,13 +426,13 @@ class GNNMetaLearner(nn.Module):
                   optimizee: Optimizee,
                   params: Optional[Dict[str, torch.Tensor]] = None,
                   step: int = 0,
-                  buffers: Optional[Dict] = None) -> Tuple[float, Dict[str, torch.Tensor], Dict]:
+                  momentum_buffers: Optional[Dict] = None) -> Tuple[float, Dict[str, torch.Tensor], Dict]:
         """
         Run one GNN-guided update on the optimizee with stateful momentum.
-        'buffers' should be a dict mapping param name to its momentum tensor.
+        'momentum_buffers' should be a dict mapping param name to its momentum tensor.
         """
-        if buffers is None:
-            buffers = {}
+        if momentum_buffers is None:
+            momentum_buffers = {}
 
         if params is None:
             params = optimizee.params()
@@ -510,7 +453,7 @@ class GNNMetaLearner(nn.Module):
             nodes.append(ParamNode(name, p, g, i, "bias" in name))
 
         if not nodes:
-            return loss.item(), params, buffers
+            return loss.item(), params, momentum_buffers
 
         node_feats = torch.stack([n.features(step, len(nodes)) for n in nodes])
         edge_index = build_edges(nodes).to(node_feats.device)
@@ -523,33 +466,36 @@ class GNNMetaLearner(nn.Module):
             step_size = torch.nan_to_num(step_size, nan=1e-3, posinf=1.0, neginf=1e-3).clamp(1e-4, 10.0)
 
         # 4. Build new params dictionary (functional, no in-place writes)
-        new_params: Dict[str, torch.Tensor] = {}
-        with torch.no_grad():
-            for node, delta, beta, step_scale in zip(nodes, deltas, momentum_coeff, step_size):
-                name = node.name
-                p = params[name]
-                g = torch.nan_to_num(grads[name], nan=0.0, posinf=1e3, neginf=-1e3)
+        new_params = {}
+        new_momentum_buffers = {}
 
-                m_prev = buffers.get(name, torch.zeros_like(g))
-                m_new = beta * m_prev + (1.0 - beta) * g
-                m_new = torch.nan_to_num(m_new, nan=0.0, posinf=1e3, neginf=-1e3)
-                buffers[name] = m_new
+        for i, node in enumerate(nodes):
+            name = node.name
+            p = params[name]
+            g = grads[name]
 
-                m_rms = m_new.pow(2).mean().sqrt().clamp(min=1e-8)
-                m_unit = m_new / (m_rms + 1e-8)
+            m_prev = momentum_buffers.get(name, torch.zeros_like(g))
 
-                update = step_scale * delta * self.update_lr * m_unit
-                upd_rms = update.pow(2).mean().sqrt().clamp(min=1e-8)
-                update = update * (0.1 / (upd_rms + 1e-8)).clamp(max=1.0)
-                update = torch.nan_to_num(update, nan=0.0, posinf=0.0, neginf=0.0)
-                p_new = torch.nan_to_num(p + update, nan=0.0, posinf=1e3, neginf=-1e3)
+            beta = momentum_coeff[i]
+            m_new = beta * m_prev + (1 - beta) * g
 
-                clip_val = self.bias_clip if node.is_bias else self.weight_clip
-                if clip_val is not None:
-                    p_new = p_new.clamp(-clip_val, clip_val)
+            # Stability tweak: RMS-normalize momentum instead of strict unit-norm direction.
+            m_rms = m_new.pow(2).mean().sqrt().clamp(min=1e-8)
+            m_unit = m_new / (m_rms + 1e-8)
 
-                # Re-leaf for next eval step so autograd.grad can compute fresh grads.
-                new_params[name] = p_new.detach().requires_grad_(True)
+            update = step_size[i] * deltas[i] * m_new
+            # Cap per-node RMS update magnitude to suppress rare destabilizing jumps.
+            p_rms = p.pow(2).mean().sqrt()
+            p_rms_safe = p_rms.clamp(min=1e-3, max=10.0)   # absolute floor — units of "typical weight scale"
+            upd_rms = update.pow(2).mean().sqrt().clamp(min=1e-8)
+            relative_scale = upd_rms / p_rms_safe
+            cap_ratio=0.5
+            update = update * (cap_ratio / relative_scale).clamp(max=1.0)
+
+            # 🔥 THIS IS THE IMPORTANT LINE - functional update
+            new_params[name] = p + update
+
+            new_momentum_buffers[name] = m_new
 
         next_loss = optimizee.loss(new_params)
         next_loss = torch.where(
@@ -557,7 +503,7 @@ class GNNMetaLearner(nn.Module):
             next_loss,
             torch.full_like(next_loss, 1e3)
         )
-        return next_loss.item(), new_params, buffers
+        return next_loss.item(), new_params, new_momentum_buffers
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Open-L2O Meta-Training
@@ -592,6 +538,9 @@ def meta_train(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(meta_opt, T_max=epochs, eta_min=meta_lr * 0.01)
     history = []
     ema_loss = None
+    recent_losses = []   # sliding window for best-5-avg checkpoint
+    best_avg5 = float('inf')
+    best_ckpt_path = (save_path.replace('.pt', '_best.pt') if save_path else None)
 
     if seed is not None:
         random.seed(seed)
@@ -622,9 +571,27 @@ def meta_train(
         meta_loss = torch.tensor(0.0, device=device)
         params = prob.params()
         momentum_buffers = {}
-        t_trunc = max(2, min(10, 2 + epoch // (epochs // 8)))
+        t_trunc = 10 # max(2, min(10, 2 + epoch // (epochs // 8)))
         epoch_total_loss = 0.0
         first_loss = None
+
+        # ── Warm-start: run GNN in inference mode for (epoch) steps before training ──
+        # epoch 1 → 1 warm step, epoch 2 → 2 warm steps, etc. (capped at unroll)
+        warm_steps = min(epoch, unroll)
+        warm_params = {k: v.detach().requires_grad_(True) for k, v in params.items()}
+        warm_buffers = {}
+        for ws in range(warm_steps):
+            _, warm_params, warm_buffers = meta.eval_step(
+                prob, params=warm_params, step=ws, momentum_buffers=warm_buffers
+            )
+            # Re-leaf after each step so the next eval_step can compute grads
+            warm_params = {k: v.detach().requires_grad_(True) for k, v in warm_params.items()}
+            warm_buffers = {k: v.detach() for k, v in warm_buffers.items()}
+        params = warm_params
+        momentum_buffers = warm_buffers
+
+        with torch.no_grad():
+            first_loss = prob.loss(params).detach().clamp(min=0.01)
         for t in range(unroll):
             loss_t, params, momentum_buffers = meta.inner_step(
                 prob,
@@ -632,12 +599,13 @@ def meta_train(
                 step=t,
                 momentum_buffers=momentum_buffers
             )
+            
             if not torch.isfinite(loss_t).item():
                 print(f"  [warn] non-finite inner loss at epoch={epoch} step={t} problem={prob_name}")
-            loss_t = torch.nan_to_num(loss_t, nan=1e3, posinf=1e3, neginf=1e3)
-            if first_loss is None:
-                first_loss = loss_t.detach().clamp(min=1e-8)
-            weight = math.exp(-0.1 * t)
+            loss_t = torch.nan_to_num(loss_t, nan=1e3, posinf=1e3, neginf=-1e3)
+            weight = 1 / (unroll - t)  # later steps get higher weight
+            # Add this inside the unroll loop temporarily
+            #print(f"  t={t} raw_loss={loss_t.item():.4f} norm={( loss_t / first_loss).item():.4f}")
             meta_loss = meta_loss + weight * (loss_t / (first_loss  + 1e-8))
             meta_loss = torch.nan_to_num(meta_loss, nan=1e3, posinf=1e3, neginf=1e3)
             epoch_total_loss += loss_t.detach().item()
@@ -675,6 +643,27 @@ def meta_train(
 
         history.append(epoch_total_loss)
         ema_loss = epoch_total_loss if ema_loss is None else 0.9 * ema_loss + 0.1 * epoch_total_loss
+
+        # ── Best-5-avg checkpoint ─────────────────────────────────────────
+        recent_losses.append(epoch_total_loss)
+        if len(recent_losses) > 5:
+            recent_losses.pop(0)
+        if len(recent_losses) == 5 and best_ckpt_path:
+            avg5 = sum(recent_losses) / 5
+            if avg5 < best_avg5:
+                best_avg5 = avg5
+                torch.save({
+                    'state_dict': meta.state_dict(),
+                    'epoch': epoch,
+                    'avg5_loss': best_avg5,
+                    'config': {
+                        'hidden_dim': meta.input_proj[0].out_features,
+                        'num_gnn_layers': len(meta.gnn),
+                        'update_lr': meta.update_lr,
+                        'weight_clip': meta.weight_clip,
+                        'bias_clip': meta.bias_clip,
+                    }
+                }, best_ckpt_path)
         # meta_loss.backward()
         # # Gradient clipping (standard in Open-L2O)
         # nn.utils.clip_grad_norm_(meta.parameters(), max_norm=1.0)
@@ -703,6 +692,8 @@ def meta_train(
         }
         torch.save(checkpoint, save_path)
         print(f"\n  Checkpoint saved → {save_path}")
+        if best_ckpt_path:
+            print(f"  Best-5-avg checkpoint → {best_ckpt_path}  (avg loss = {best_avg5:.4f})")
 
     return history
 
@@ -747,7 +738,7 @@ def evaluate(
                     prob,
                     params=params,
                     step=t,
-                    buffers=eval_buffers,
+                    momentum_buffers=eval_buffers,
                 )
                 gnn_losses.append(l_val)
             gnn_curves.append(gnn_losses)
@@ -796,6 +787,119 @@ def evaluate(
     return results
 
 
+def evaluate2(
+    meta: GNNMetaLearner,
+    problem_names: List[str],
+    steps: int = 100,
+    device: str = "cpu",
+    seeds: List[int] = (0, 1, 2),
+) -> Dict[str, Dict]:
+    """
+    Two-phase evaluation.
+
+    For NN problems (MNIST/CIFAR):
+      1. Adapt on first `steps` batches.
+      2. Evaluate mean loss on the remaining batches.
+
+    For non-NN problems: falls back to the standard `evaluate` behavior.
+    """
+    meta = meta.to(device).eval()
+    results = {}
+
+    print(f"\n{'='*60}")
+    print(f"  Open-L2O Evaluation2   (adapt steps = {steps})")
+    print(f"  Problems : {problem_names}")
+    print(f"{'='*60}")
+
+    for pname in problem_names:
+        is_nn_problem = pname.startswith(("mnist", "cifar"))
+
+        if not is_nn_problem:
+            sub = evaluate(meta, [pname], steps=steps, device=device, seeds=seeds)
+            results[pname] = sub[pname]
+            continue
+
+        gnn_finals, sgd_finals, adam_finals = [], [], []
+        adapt_info_printed = False
+
+        for seed in seeds:
+            # -------------------- GNN --------------------
+            prob = make_problem(pname, device=device)
+            prob.reset(seed=seed)
+            total_batches = len(prob.loader)
+            adapt_steps = min(steps, max(total_batches - 1, 0))
+
+            params = {k: v.detach().requires_grad_(True) for k, v in prob.params().items()}
+            buffers = None
+            for t in range(adapt_steps):
+                _, params, buffers = meta.eval_step(
+                    prob,
+                    params=params,
+                    step=t,
+                    momentum_buffers=buffers,
+                )
+                params = {k: v.detach().requires_grad_(True) for k, v in params.items()}
+                if buffers is not None:
+                    buffers = {k: v.detach() for k, v in buffers.items()}
+
+            rem_batches = max(total_batches - adapt_steps, 1)
+            eval_losses = []
+            with torch.no_grad():
+                for _ in range(rem_batches):
+                    l = prob.loss(params=params)
+                    eval_losses.append(float(l.detach().item()))
+            gnn_finals.append(sum(eval_losses) / len(eval_losses))
+
+            # -------------------- SGD --------------------
+            prob = make_problem(pname, device=device)
+            prob.reset(seed=seed)
+            sgd = torch.optim.SGD(prob.params().values(), lr=0.01)
+            for _ in range(adapt_steps):
+                sgd.zero_grad()
+                loss = prob.loss()
+                loss.backward()
+                sgd.step()
+
+            sgd_eval_losses = []
+            with torch.no_grad():
+                for _ in range(rem_batches):
+                    sgd_eval_losses.append(float(prob.loss().detach().item()))
+            sgd_finals.append(sum(sgd_eval_losses) / len(sgd_eval_losses))
+
+            # -------------------- Adam -------------------
+            prob = make_problem(pname, device=device)
+            prob.reset(seed=seed)
+            adam = torch.optim.Adam(prob.params().values(), lr=0.01)
+            for _ in range(adapt_steps):
+                adam.zero_grad()
+                loss = prob.loss()
+                loss.backward()
+                adam.step()
+
+            adam_eval_losses = []
+            with torch.no_grad():
+                for _ in range(rem_batches):
+                    adam_eval_losses.append(float(prob.loss().detach().item()))
+            adam_finals.append(sum(adam_eval_losses) / len(adam_eval_losses))
+
+            if not adapt_info_printed:
+                print(f"\n  [{pname}]")
+                print(f"    adapt batches = {adapt_steps}/{total_batches} | eval batches = {rem_batches}")
+                adapt_info_printed = True
+
+        results[pname] = {
+            "gnn": [sum(gnn_finals) / len(gnn_finals)],
+            "sgd": [sum(sgd_finals) / len(sgd_finals)],
+            "adam": [sum(adam_finals) / len(adam_finals)],
+        }
+
+        print(f"    GNN   final loss = {results[pname]['gnn'][-1]:.4f}")
+        print(f"    SGD   final loss = {results[pname]['sgd'][-1]:.4f}")
+        print(f"    ADAM  final loss = {results[pname]['adam'][-1]:.4f}")
+
+    return results
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
@@ -839,6 +943,16 @@ def main():
     e.add_argument("--layers",  type=int, default=3)
     e.add_argument("--device",  type=str, default="cpu")
 
+    # eval2 (adapt on first steps, evaluate on remaining batches)
+    e2 = sub.add_parser("eval2")
+    e2.add_argument("--checkpoint", type=str, required=True)
+    e2.add_argument("--problems", nargs="+",
+                    default=["mnist_test", "mnist_conv_test", "cifar_conv_test"])
+    e2.add_argument("--steps",   type=int, default=100)
+    e2.add_argument("--hidden",  type=int, default=64)
+    e2.add_argument("--layers",  type=int, default=3)
+    e2.add_argument("--device",  type=str, default="cpu")
+
     # demo
     sub.add_parser("demo")
 
@@ -881,6 +995,30 @@ def main():
         
         results = evaluate(meta, args.problems,
                            steps=args.steps, device=args.device)
+        _print_summary(results)
+
+    elif args.cmd == "eval2":
+        ckpt = torch.load(args.checkpoint, map_location=args.device)
+
+        config = ckpt.get('config', {})
+        hidden = config.get('hidden_dim', args.hidden)
+        layers = config.get('num_gnn_layers', args.layers)
+        u_lr = config.get('update_lr', 0.01)
+        w_clip = config.get('weight_clip', None)
+        b_clip = config.get('bias_clip', None)
+
+        meta = GNNMetaLearner(
+            hidden_dim=hidden,
+            num_gnn_layers=layers,
+            update_lr=u_lr,
+            weight_clip=w_clip,
+            bias_clip=b_clip,
+        )
+
+        meta.load_state_dict(ckpt['state_dict'] if 'state_dict' in ckpt else ckpt)
+
+        results = evaluate2(meta, args.problems,
+                            steps=args.steps, device=args.device)
         _print_summary(results)
 
     elif args.cmd == "demo" or args.cmd is None:

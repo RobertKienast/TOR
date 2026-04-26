@@ -92,13 +92,16 @@ class QuadraticProblem(Optimizee):
         self.A = (W.T @ W) / self.dim + 0.1 * torch.eye(self.dim, device=self.device)
         self.b = torch.randn(self.dim, device=self.device)
         # Optimizee variable
-        self._x = nn.Parameter(torch.randn(self.dim, device=self.device))
+        self.x_star = -0.5 * torch.linalg.solve(self.A, self.b)
+        noise = torch.randn(self.dim, device=self.device)
+        self._x = nn.Parameter(self.x_star + noise)
+        
 
-    def loss(self, params: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
-        if params is None:
-            params = self.params()
-        x = params["x"]
-        return (x @ self.A @ x + self.b @ x)
+    def loss(self, params=None):
+        x = params["x"] if params is not None else self._x
+        # Loss is distance from optimum — always >= 0
+        delta = x - self.x_star
+        return delta @ self.A @ delta
 
     def params(self) -> Dict[str, torch.Tensor]:
         return {"x": self._x}
