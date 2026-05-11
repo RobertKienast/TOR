@@ -71,15 +71,15 @@ class Optimizee:
 
 class QuadraticProblem(Optimizee):
     """
-    f(x) = x^T A x + b^T x
-    A is a random PSD matrix, b is a random vector.
-    Exactly matches the Open-L2O quadratic benchmark.
+    f(x) = mean( sum_cols( (Wx - y)^2 ) )
+    Matches Open-L2O paper: batch_size=128, num_dims=10,
+    W [B,n,n] and y [B,n] uniform [0,1], x [B,n] init normal(stddev=0.01).
     """
 
-    def __init__(self, dim: int = 10, batch_size: int = 128,
+    def __init__(self, batch_size: int = 128, num_dims: int = 10,
                  device: str = "cpu"):
-        self.dim = dim
         self.batch_size = batch_size
+        self.num_dims = num_dims
         self.device = device
         self._x: Optional[torch.Tensor] = None
         self.reset()
@@ -87,21 +87,16 @@ class QuadraticProblem(Optimizee):
     def reset(self, seed: Optional[int] = None):
         if seed is not None:
             torch.manual_seed(seed)
-        # Random PSD A = W^T W + eps*I
-        W = torch.randn(self.dim, self.dim, device=self.device)
-        self.A = (W.T @ W) / self.dim + 0.1 * torch.eye(self.dim, device=self.device)
-        self.b = torch.randn(self.dim, device=self.device)
-        # Optimizee variable
-        self.x_star = -0.5 * torch.linalg.solve(self.A, self.b)
-        noise = torch.randn(self.dim, device=self.device)
-        self._x = nn.Parameter(self.x_star + noise)
-        
+        self.W = torch.rand(self.batch_size, self.num_dims, self.num_dims, device=self.device)
+        self.y = torch.rand(self.batch_size, self.num_dims, device=self.device)
+        self._x = nn.Parameter(
+            torch.randn(self.batch_size, self.num_dims, device=self.device) * 0.01
+        )
 
     def loss(self, params=None):
-        x = params["x"] if params is not None else self._x
-        # Loss is distance from optimum — always >= 0
-        delta = x - self.x_star
-        return delta @ self.A @ delta
+        x = params["x"] if params is not None else self._x          # [B, n]
+        Wx = (self.W @ x.unsqueeze(-1)).squeeze(-1)                  # [B, n]
+        return ((Wx - self.y) ** 2).sum(dim=1).mean()
 
     def params(self) -> Dict[str, torch.Tensor]:
         return {"x": self._x}
@@ -113,16 +108,15 @@ class QuadraticProblem(Optimizee):
 
 class LASSOProblem(Optimizee):
     """
-    f(x) = 0.5 * ||Ax - b||_2^2 + lam * ||x||_1
-
-    Default dims follow Open-L2O paper: A in R^{m x n}, n=20, m=10.
-    The L1 term is smoothed via soft-thresholding proxy for grad flow.
+    f(x) = mean( 0.5*||Wx-y||^2 + lam*||x||_1 )
+    Matches Open-L2O paper: batch_size=128, num_dims=10, lam=0.005,
+    W [B,n,n] and y [B,n,1] uniform [0,1], x [B,n] init normal(stddev=0.01).
     """
 
-    def __init__(self, n: int = 20, m: int = 10,
-                 lam: float = 0.5, device: str = "cpu"):
-        self.n = n
-        self.m = m
+    def __init__(self, batch_size: int = 128, num_dims: int = 10,
+                 lam: float = 0.005, device: str = "cpu"):
+        self.batch_size = batch_size
+        self.num_dims = num_dims
         self.lam = lam
         self.device = device
         self._x: Optional[torch.Tensor] = None
@@ -131,18 +125,19 @@ class LASSOProblem(Optimizee):
     def reset(self, seed: Optional[int] = None):
         if seed is not None:
             torch.manual_seed(seed)
-        self.A_mat = torch.randn(self.m, self.n, device=self.device)
-        self.b_vec = torch.randn(self.m, device=self.device)
-        self._x = nn.Parameter(torch.zeros(self.n, device=self.device))
+        self.W = torch.rand(self.batch_size, self.num_dims, self.num_dims, device=self.device)
+        self.y = torch.rand(self.batch_size, self.num_dims, 1, device=self.device)
+        self._x = nn.Parameter(
+            torch.randn(self.batch_size, self.num_dims, device=self.device) * 0.01
+        )
 
     def loss(self, params: Optional[Dict[str, torch.Tensor]] = None):
-        if params is None:
-            params = self.params()
-
-        x = params["x"]   # ✅ MUST be dict access
-
-        residual = self.A_mat @ x - self.b_vec
-        return 0.5 * residual.pow(2).sum() + self.lam * x.abs().sum()
+        x = params["x"] if params is not None else self._x          # [B, n]
+        Wx = self.W @ x.unsqueeze(-1)                                # [B, n, 1]
+        residual = Wx - self.y                                       # [B, n, 1]
+        l2 = 0.5 * residual.pow(2).sum(dim=[-2, -1]).mean()
+        l1 = self.lam * x.abs().sum(dim=1).mean()
+        return l2 + l1
 
     def params(self) -> Dict[str, torch.Tensor]:
         return {"x": self._x}
@@ -154,13 +149,17 @@ class LASSOProblem(Optimizee):
 
 class RastriginProblem(Optimizee):
     """
-    f(x) = 10n + sum_i [ x_i^2 - 10*cos(2*pi*x_i) ]
-    Global min = 0 at x = 0.
-    Open-L2O uses dim=20, init in [-5.12, 5.12].
+    f(x) = mean( 0.5*||Ax-B||^2 - alpha*C^T cos(2pi x) + alpha*n )
+    Matches Open-L2O paper: randomised A/B/C per reset, batch_size=128,
+    num_dims=10, alpha=10. A/B/C all normal(stddev=1).
+    x [B,n,1] init normal(stddev=1).
     """
 
-    def __init__(self, dim: int = 20, device: str = "cpu"):
-        self.dim = dim
+    def __init__(self, batch_size: int = 128, num_dims: int = 10,
+                 alpha: float = 10.0, device: str = "cpu"):
+        self.batch_size = batch_size
+        self.num_dims = num_dims
+        self.alpha = alpha
         self.device = device
         self._x: Optional[torch.Tensor] = None
         self.reset()
@@ -168,16 +167,19 @@ class RastriginProblem(Optimizee):
     def reset(self, seed: Optional[int] = None):
         if seed is not None:
             torch.manual_seed(seed)
-        init = torch.FloatTensor(self.dim).uniform_(-5.12, 5.12).to(self.device)
-        self._x = nn.Parameter(init)
+        self.A = torch.randn(self.batch_size, self.num_dims, self.num_dims, device=self.device)
+        self.B = torch.randn(self.batch_size, self.num_dims, 1, device=self.device)
+        self.C = torch.randn(self.batch_size, self.num_dims, 1, device=self.device)
+        self._x = nn.Parameter(
+            torch.randn(self.batch_size, self.num_dims, 1, device=self.device)
+        )
 
     def loss(self, params: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
-        if params is None:
-            params = self.params()
-        x = params["x"]
-        n = self.dim
-        return (10 * n
-                + (x.pow(2) - 10 * torch.cos(2 * math.pi * x)).sum())
+        x = params["x"] if params is not None else self._x          # [B, n, 1]
+        product = self.A @ x                                         # [B, n, 1]
+        ras_norm_sq = (product - self.B).pow(2).sum(dim=[-2, -1])   # [B]
+        cqTcos = (self.C.transpose(-2, -1) @ torch.cos(2 * math.pi * x)).squeeze(-1).squeeze(-1)  # [B]
+        return (0.5 * ras_norm_sq - self.alpha * cqTcos + self.alpha * self.num_dims).mean()
 
     def params(self) -> Dict[str, torch.Tensor]:
         return {"x": self._x}
@@ -348,9 +350,9 @@ TRAIN_PROBLEMS = {
 
 TEST_PROBLEMS = {
     # Held-out: same families, different random seeds / harder dims
-    "quadratic_test":  lambda d="cpu": QuadraticProblem(dim=20,  device=d),
-    "lasso_test":      lambda d="cpu": LASSOProblem(n=40, m=20,  device=d),
-    "rastrigin_test":  lambda d="cpu": RastriginProblem(dim=40,  device=d),
+    "quadratic_test":  lambda d="cpu": QuadraticProblem(num_dims=20,  device=d),
+    "lasso_test":      lambda d="cpu": LASSOProblem(num_dims=40,      device=d),
+    "rastrigin_test":  lambda d="cpu": RastriginProblem(num_dims=40,  device=d),
     "mnist_test":      lambda d="cpu": MNISTProblem(device=d),
     "mnist_relu_test": lambda d="cpu": MNISTReLUProblem(device=d),
     "mnist_conv_test": lambda d="cpu": MNISTConvProblem(device=d),

@@ -84,10 +84,13 @@ class ParamNode:
 
         # ─────────────────────────────
         # 1. Core magnitude features (CRITICAL)
+        # Normalise by sqrt(numel) → per-element RMS norm, scale-invariant
+        # across different tensor sizes (10-element vs 1280-element tensors).
         # ─────────────────────────────
-        w_norm = w.norm(2)
-        g_norm = g_flat.norm(2)
-        m_norm = m_flat.norm(2)
+        numel_sqrt = math.sqrt(max(w.numel(), 1))
+        w_norm = w.norm(2) / numel_sqrt
+        g_norm = g_flat.norm(2) / numel_sqrt
+        m_norm = m_flat.norm(2) / numel_sqrt
 
         log_w_norm = torch.log(w_norm + 1e-8)
         log_g_norm = torch.log(g_norm + 1e-8)
@@ -384,7 +387,7 @@ class GNNMetaLearner(nn.Module):
         delta = torch.tanh(raw_out[:, 0])
         momentum_coeff = torch.sigmoid(raw_out[:, 1])
         log_lr = raw_out[:, 2]  # learned log step size, unconstrained
-        step_size = torch.exp(log_lr.clamp(-6, 2))
+        step_size = torch.exp(log_lr.clamp(-8, 0))  # step_size ∈ [3.4e-4, 1.0]
         return delta, momentum_coeff, step_size
 
     # ── differentiable inner step (for meta-training) ─────────────────────
@@ -441,7 +444,7 @@ class GNNMetaLearner(nn.Module):
         # Clamp GNN outputs to reasonable ranges (preserves grad_fn)
         deltas = torch.clamp(deltas, min=-1.0, max=1.0)
         momentum_coeff = torch.clamp(momentum_coeff, min=0.0, max=1.0)
-        step_size = torch.clamp(step_size, min=1e-4, max=10.0)
+        step_size = torch.clamp(step_size, min=1e-4, max=1.0)
 
         new_params = {}
         new_momentum_buffers = {}
@@ -456,24 +459,22 @@ class GNNMetaLearner(nn.Module):
             beta = momentum_coeff[i]
             m_new = beta * m_prev + (1 - beta) * g
 
-            # Stability tweak: RMS-normalize momentum instead of strict unit-norm direction.
-            m_rms = m_new.pow(2).mean().sqrt().clamp(min=1e-8)
-            m_unit = m_new / (m_rms + 1e-8)
+            # Adam-style second-moment buffer stored under a __v__ key.
+            # v retains memory of past large gradients: when g→0 near convergence,
+            # v_hat_rms stays large → steps decay naturally → convergence.
+            # Using instantaneous g_rms would blow up: 1/g_rms → ∞ as g→0.
+            beta2 = 0.999
+            v_key = name + "__v__"
+            v_prev = momentum_buffers.get(v_key, torch.zeros_like(g))
+            v_new = beta2 * v_prev + (1 - beta2) * g.pow(2)
+            bc = 1.0 - beta2 ** (step + 1)  # bias correction
+            v_hat_rms = (v_new / bc).mean().sqrt().clamp(min=1e-8)
+            update = step_size[i] * deltas[i] * m_new / (v_hat_rms + 1e-8)
 
-            update_dir = 0.7 * m_new + 0.3 * g
-            update = step_size[i] * deltas[i] * update_dir      
-            # Cap per-node RMS update magnitude to suppress rare destabilizing jumps.
-            p_rms = p.pow(2).mean().sqrt()
-            p_rms_safe = p_rms.clamp(min=1e-3, max=10.0)   # absolute floor — units of "typical weight scale"
-            upd_rms = update.pow(2).mean().sqrt().clamp(min=1e-8)
-            relative_scale = upd_rms / p_rms_safe
-            cap_ratio=0.7
-            update = update * (cap_ratio / relative_scale).clamp(max=1.0)
-
-            # 🔥 THIS IS THE IMPORTANT LINE - functional update
             new_params[name] = p + update
 
             new_momentum_buffers[name] = m_new
+            new_momentum_buffers[v_key] = v_new
 
         # ---- 5. Compute next loss (connected graph!) ----
         # new_params = {
@@ -527,7 +528,7 @@ class GNNMetaLearner(nn.Module):
             deltas, momentum_coeff, step_size = self(node_feats, edge_index)
             deltas = torch.nan_to_num(deltas, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1.0, 1.0)
             momentum_coeff = torch.nan_to_num(momentum_coeff, nan=0.5, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-            step_size = torch.nan_to_num(step_size, nan=1e-3, posinf=1.0, neginf=1e-3).clamp(1e-4, 10.0)
+            step_size = torch.nan_to_num(step_size, nan=1e-3, posinf=1.0, neginf=1e-3).clamp(1e-4, 1.0)
 
         # 4. Build new params dictionary (functional, no in-place writes)
         new_params = {}
@@ -543,24 +544,19 @@ class GNNMetaLearner(nn.Module):
             beta = momentum_coeff[i]
             m_new = beta * m_prev + (1 - beta) * g
 
-            # Stability tweak: RMS-normalize momentum instead of strict unit-norm direction.
-            m_rms = m_new.pow(2).mean().sqrt().clamp(min=1e-8)
-            m_unit = m_new / (m_rms + 1e-8)
+            # Adam-style second-moment buffer — same rule as inner_step
+            beta2 = 0.999
+            v_key = name + "__v__"
+            v_prev = momentum_buffers.get(v_key, torch.zeros_like(g))
+            v_new = beta2 * v_prev + (1 - beta2) * g.pow(2)
+            bc = 1.0 - beta2 ** (step + 1)
+            v_hat_rms = (v_new / bc).mean().sqrt().clamp(min=1e-8)
+            update = step_size[i] * deltas[i] * m_new / (v_hat_rms + 1e-8)
 
-            update_dir = 0.7 * m_new + 0.3 * g
-            update = step_size[i] * deltas[i] * update_dir
-            # Cap per-node RMS update magnitude to suppress rare destabilizing jumps.
-            p_rms = p.pow(2).mean().sqrt()
-            p_rms_safe = p_rms.clamp(min=1e-3, max=10.0)   # absolute floor — units of "typical weight scale"
-            upd_rms = update.pow(2).mean().sqrt().clamp(min=1e-8)
-            relative_scale = upd_rms / p_rms_safe
-            cap_ratio=0.5
-            update = update * (cap_ratio / relative_scale).clamp(max=1.0)
-
-            # 🔥 THIS IS THE IMPORTANT LINE - functional update
             new_params[name] = p + update
 
             new_momentum_buffers[name] = m_new
+            new_momentum_buffers[v_key] = v_new
 
         next_loss = optimizee.loss(new_params)
         next_loss = torch.where(
@@ -664,30 +660,16 @@ def meta_train(
         meta_opt.zero_grad()
         meta_loss = torch.tensor(0.0, device=device)
         params = prob.params()
-        momentum_buffers = persistent_momentum[prob_name]
+        # Fresh momentum each episode — persistent momentum is wrong when W/y/A/B/C
+        # are resampled on reset: the old direction points at the previous optimum.
+        momentum_buffers = {}
         t_trunc = 10 # max(2, min(10, 2 + epoch // (epochs // 8)))
         epoch_total_loss = 0.0
         first_loss = None
 
-        # ── Warm-start: run GNN in inference mode for (epoch) steps before training ──
-        # epoch 1 → 1 warm step, epoch 2 → 2 warm steps, etc. (capped at unroll)
-        warm_steps = min(epoch, unroll)
-        warm_params = {k: v.detach().requires_grad_(True) for k, v in params.items()}
-        warm_buffers = {}
-        for ws in range(warm_steps):
-            _, warm_params, warm_buffers = meta.eval_step(
-                prob, params=warm_params, step=ws, momentum_buffers=warm_buffers
-            )
-            # Re-leaf after each step so the next eval_step can compute grads
-            warm_params = {k: v.detach().requires_grad_(True) for k, v in warm_params.items()}
-            warm_buffers = {k: v.detach() for k, v in warm_buffers.items()}
-        params = warm_params
-        momentum_buffers = warm_buffers
-
-        # Before epoch loop:
-        
-
-        # Each epoch, after warm-start:
+        # Each epoch, starting from reset position (no warm-start — would cause
+        # train/test distribution mismatch: training from near-convergence but
+        # evaluating from the raw initial position).
         with torch.no_grad():
             raw_first = float(prob.loss(params).detach().clamp(min=1e-6))
         if loss_ema[prob_name] is None:
@@ -796,7 +778,6 @@ def meta_train(
         # meta_opt.step()
 
         scheduler.step()
-        persistent_momentum[prob_name] = {k: v.detach() for k, v in momentum_buffers.items()}
         if epoch % log_every == 0 or epoch == 1:
             print(f"  Epoch {epoch:4d}/{epochs} | "
                   f"meta-loss = {epoch_total_loss:.4f} | "
