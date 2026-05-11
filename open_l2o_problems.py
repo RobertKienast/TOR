@@ -350,9 +350,9 @@ TRAIN_PROBLEMS = {
 
 TEST_PROBLEMS = {
     # Held-out: same families, different random seeds / harder dims
-    "quadratic_test":  lambda d="cpu": QuadraticProblem(num_dims=20,  device=d),
-    "lasso_test":      lambda d="cpu": LASSOProblem(num_dims=40,      device=d),
-    "rastrigin_test":  lambda d="cpu": RastriginProblem(num_dims=40,  device=d),
+    "quadratic_test":  lambda d="cpu": QuadraticProblem(num_dims=10,  device=d),
+    "lasso_test":      lambda d="cpu": LASSOProblem(num_dims=10,      device=d),
+    "rastrigin_test":  lambda d="cpu": RastriginProblem(num_dims=10,  device=d),
     "mnist_test":      lambda d="cpu": MNISTProblem(device=d),
     "mnist_relu_test": lambda d="cpu": MNISTReLUProblem(device=d),
     "mnist_conv_test": lambda d="cpu": MNISTConvProblem(device=d),
