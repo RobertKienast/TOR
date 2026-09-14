@@ -53,7 +53,8 @@ from open_l2o_problems import make_problem, Optimizee, TRAIN_PROBLEMS, TEST_PROB
 # Graph extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
-NODE_DIM = 10  # feature vector dimensionality per parameter-node
+NODE_DIM = 12  # feature vector dimensionality per parameter-node (10 real-param
+                # features + is_hub + is_mlp_node, see ParamNode.features())
 
 def log_abs_scale(val, eps=1e-8):
         # Standard trick in "Learning to learn by gradient descent by gradient descent"
@@ -62,25 +63,108 @@ def log_abs_scale(val, eps=1e-8):
 
 class ParamNode:
     """
-    One node in the computation graph = one (weight or bias) parameter tensor.
-    Features use ONLY: gradient statistics + weight/bias statistics.
-    """
-    __slots__ = ("name", "param", "grad", "layer_idx", "is_bias")
+    One node in the computation graph.
 
-    def __init__(self, name, param, grad, layer_idx, is_bias):
+    Most nodes correspond to a full parameter tensor. Conv layers are split more
+    finely: each spatial kernel position inside each output filter becomes its
+    own node, and conv biases are split into one node per output filter.
+    """
+    __slots__ = (
+        "name",
+        "param",
+        "grad",
+        "layer_idx",
+        "is_bias",
+        "is_conv_node",
+        "module_key",
+        "filter_idx",
+        "spatial_row",
+        "spatial_col",
+        "row_start",
+        "row_end",
+        "node_kind",
+        "hub_embed",
+    )
+
+    def __init__(
+        self,
+        name,
+        param,
+        grad,
+        layer_idx,
+        is_bias,
+        is_conv_node: bool = False,
+        module_key: Optional[str] = None,
+        filter_idx: Optional[int] = None,
+        spatial_row: Optional[int] = None,
+        spatial_col: Optional[int] = None,
+        row_start: Optional[int] = None,
+        row_end: Optional[int] = None,
+        node_kind: str = "full",
+        hub_embed: Optional[torch.Tensor] = None,
+    ):
         self.name = name
         self.param = param
         self.grad = grad
         self.layer_idx = layer_idx
         self.is_bias = is_bias
-    def features(self, step: int, n_layers: int, momentum_buffer: Optional[torch.Tensor] = None) -> torch.Tensor:
+        self.is_conv_node = is_conv_node
+        self.module_key = module_key
+        self.filter_idx = filter_idx
+        self.spatial_row = spatial_row
+        self.spatial_col = spatial_col
+        self.row_start = row_start
+        self.row_end = row_end
+        self.node_kind = node_kind
+        self.hub_embed = hub_embed
+
+    def slice_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.node_kind == "hub":
+            return None  # hub nodes have no backing parameter tensor
+        if self.node_kind == "conv_weight":
+            return tensor[self.filter_idx, :, self.spatial_row, self.spatial_col]
+        if self.node_kind == "conv_bias":
+            return tensor[self.filter_idx:self.filter_idx + 1]
+        if self.node_kind == "linear_row":
+            return tensor[self.row_start:self.row_end, :]
+        if self.node_kind == "linear_bias":
+            return tensor[self.row_start:self.row_end]
+        return tensor
+
+    def assign_into(self, tensor: torch.Tensor, value: torch.Tensor) -> None:
+        if self.node_kind == "hub":
+            return  # hub nodes don't own real params — no update to apply
+        if self.node_kind == "conv_weight":
+            tensor[self.filter_idx, :, self.spatial_row, self.spatial_col] = value
+        elif self.node_kind == "conv_bias":
+            tensor[self.filter_idx:self.filter_idx + 1] = value
+        elif self.node_kind == "linear_row":
+            tensor[self.row_start:self.row_end, :] = value
+        elif self.node_kind == "linear_bias":
+            tensor[self.row_start:self.row_end] = value
+        else:
+            tensor[...] = value
+
+    def features(
+        self,
+        step: int,
+        n_layers: int,
+        momentum_buffer: Optional[torch.Tensor] = None,
+        second_moment_buffer: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.node_kind == "hub":
+            # Virtual node with no real parameter/gradient — its feature
+            # vector IS its learned (or fallback zero) embedding.
+            return self.hub_embed
         p = self.param.detach().float()
         g = self.grad.to(torch.float32)
-        m = momentum_buffer if momentum_buffer is not None else torch.zeros_like(g)
+        m = self.slice_tensor(momentum_buffer) if momentum_buffer is not None else torch.zeros_like(g)
+        v = self.slice_tensor(second_moment_buffer) if second_moment_buffer is not None else torch.zeros_like(g)
 
         w = p.flatten()
         g_flat = g.flatten()
         m_flat = m.flatten()
+        v_flat = v.flatten()
 
         # ─────────────────────────────
         # 1. Core magnitude features (CRITICAL)
@@ -97,61 +181,61 @@ class ParamNode:
         log_m_norm = torch.log(m_norm + 1e-8)
 
         # ─────────────────────────────
-        # 2. Distribution features (VERY IMPORTANT)
-        # ─────────────────────────────
-        g_std = g_flat.std()
-        w_std = w.std()
-
-        g_abs = g_flat.abs()
-        w_abs = w.abs()
-
-        g_max = g_abs.max()
-        w_max = w_abs.max()
-
-        # Quantiles (restore lost structure)
-        q = torch.tensor([0.25, 0.5, 0.75], device=g.device)
-        g_q = torch.quantile(g_flat, q)
-        w_q = torch.quantile(w, q)
-
-        # ─────────────────────────────
         # 3. Relative scale (safe ratios)
         # ─────────────────────────────
-        rel_grad = g_norm / (w_norm + 1e-8)
         w_to_g_ratio = torch.log((w_norm + 1e-8) / (g_norm + 1e-8))
 
         # ─────────────────────────────
-        # 4. Directional (LOW WEIGHT but useful)
+        # 4. Directional
         # ─────────────────────────────
         cos_sim = F.cosine_similarity(g_flat, m_flat, dim=0)
-
-        sign_consistency = g_flat.sign().mean()  # keep sign info (not abs)
-        sign_flip_ratio = (g_flat[:-1] * g_flat[1:] < 0).float().mean() if g_flat.numel() > 1 else torch.tensor(0.0, device=g.device)
-
-        # ─────────────────────────────
-        # 5. Sparsity / structure
-        # ─────────────────────────────
-        sparsity = (g_abs < 1e-6).float().mean()
-
-        topk = min(10, g_abs.numel())
-        topk_mean = g_abs.topk(topk).values.mean()
 
         # ─────────────────────────────
         # 6. Means (log-scaled, safe)
         # ─────────────────────────────
-        g_mean = log_abs_scale(g_flat.mean())
-        w_mean = log_abs_scale(w.mean())
 
         # ─────────────────────────────
         # 7. Structural context
         # ─────────────────────────────
         layer_pos = torch.tensor(self.layer_idx / max(n_layers - 1, 1), device=g.device)
         is_bias = torch.tensor(1.0 if self.is_bias else 0.0, device=g.device)
+        is_conv_node = torch.tensor(1.0 if self.is_conv_node else 0.0, device=g.device)
 
         # ─────────────────────────────
         # 8. Training progress
         # ─────────────────────────────
-        progress = torch.tensor(step / 1000.0, device=g.device)
-        snr = log_g_norm - log_w_norm  # signal-to-noise ratio in log space
+        progress = torch.tensor(min(step / 1000.0, 1.0), device=g.device)
+
+        # g_to_v_ratio: log(current grad RMS) - log(sqrt of this param's
+        # persisted Adam-style second-moment EMA, i.e. the same `v` buffer
+        # _apply_node_updates() already maintains as momentum_buffers[name +
+        # "__v__"] and divides the update by (as v_hat_rms) -- but which was
+        # previously NEVER fed back in as an input feature, so the network
+        # had to decide delta/momentum_coeff/step_size "blind" to the exact
+        # normalization its own update rule then applies. This is the
+        # log-space equivalent of Adam's own g/sqrt(v) ratio: near 0 means
+        # "this step's gradient is typical relative to its own recent
+        # history" (a stable/Adam-normalized regime); large positive means
+        # the gradient just spiked relative to its history (non-stationary/
+        # noisy region worth a more cautious step).
+        # (Replaces the old `snr = log_g_norm - log_w_norm` feature, which
+        # was an exact duplicate of w_to_g_ratio above -- log_g_norm -
+        # log_w_norm is precisely -w_to_g_ratio -- so it wasted a feature
+        # slot on redundant information instead of new signal.)
+        v_rms = v_flat.clamp(min=0).mean().sqrt()
+        log_v_rms = torch.log(v_rms + 1e-8)
+        g_to_v_ratio = log_g_norm - log_v_rms
+
+        # ─────────────────────────────
+        # 9. Domain / hub tags (used by edge_direction_from_node_feats to
+        # tag edges as hub-edges / conv-domain / mlp-domain — see
+        # NODE_FEATURE_IS_HUB_IDX / NODE_FEATURE_IS_MLP_IDX below).
+        # ─────────────────────────────
+        is_hub = torch.tensor(0.0, device=g.device)  # never 1 for a real param node
+        is_mlp_node = torch.tensor(
+            1.0 if self.node_kind in ("linear_row", "linear_bias") else 0.0, device=g.device
+        )
+
         # ─────────────────────────────
         # FINAL FEATURE VECTOR
         # ─────────────────────────────
@@ -160,7 +244,7 @@ class ParamNode:
             w_norm.unsqueeze(0),
             g_norm.unsqueeze(0),
             m_norm.unsqueeze(0),
-            snr.unsqueeze(0).clamp(-5.0, 5.0),
+            g_to_v_ratio.unsqueeze(0).clamp(-5.0, 5.0),
 
             # Distribution (1)
             #g_std.unsqueeze(0),
@@ -170,76 +254,575 @@ class ParamNode:
 
             # Directional (2)
             cos_sim.unsqueeze(0),
-            sign_flip_ratio.unsqueeze(0),
+            is_conv_node.unsqueeze(0),
 
             # Context (3)
             layer_pos.unsqueeze(0),
             is_bias.unsqueeze(0),
             progress.unsqueeze(0),
+
+            # Domain / hub tags (2)
+            is_hub.unsqueeze(0),
+            is_mlp_node.unsqueeze(0),
         ])
 
         return torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-    def get_enhanced_features(self, step, total_nodes, momentum_buffer):
-        p = self.param
-        g = self.grad
-        m = momentum_buffer  # The history from previous step
-        
-        # 1. Basic Stats
-        p_norm = p.pow(2).mean().sqrt()
-        g_norm = g.pow(2).mean().sqrt()
-        
-        # 2. History & Curvature (The "Engine" of the change)
-        # Cosine similarity between current grad and previous momentum
-        # High similarity = "keep going", Low/Negative = "we are oscillating/turning"
-        cos_sim = torch.nn.functional.cosine_similarity(g.flatten(), m.flatten(), dim=0)
-        
-        # 3. Relative Scale
-        # Helps the GNN realize if the gradient is exploding or vanishing relative to weights
-        rel_grad = g_norm / (p_norm + 1e-8)
-        
-        # 4. Temporal Features
-        progress = torch.tensor([step / 1000.0]).to(p.device) # Normalized progress
-        
-        # 5. Structural One-Hot
-        # Is it a bias or a weight? Biases often need different scales.
-        is_bias = torch.tensor([1.0 if "bias" in self.name else 0.0]).to(p.device)
 
-        return torch.cat([
-            p_norm.unsqueeze(0),
-            g_norm.unsqueeze(0),
-            cos_sim.unsqueeze(0), 
-            rel_grad.unsqueeze(0),
-            progress,
-            is_bias
-        ])
+def build_edges(nodes: List[ParamNode], connect_conv_filters: bool = False) -> torch.Tensor:
+    """Sparse edge topology for deeper models.
 
-def build_edges(nodes: List[ParamNode]) -> torch.Tensor:
-    """Intra-layer + sequential inter-layer edges."""
-    device = nodes[0].param.device
+    Intra-layer  : weight <-> bias only (avoids O(N^2) weight<->weight clutter),
+                   plus local spatial conv edges (Markov-blanket style: each
+                   conv weight node only ever talks to its own filter's 4
+                   spatial neighbours + its own filter's bias).
+    Inter-layer  :
+      - Linear -> Linear (adjacent MLP layers): REAL full bipartite
+        connectivity — every `linear_row` node in the earlier layer connects
+        to every `linear_row` node in the next layer, because that edge
+        genuinely exists as W[j, i] in the real network. No sampling/capping.
+      - Conv -> Conv (adjacent conv layers): unchanged representative-node
+        (connector) wiring, as before.
+      - Conv <-> Linear (the conv/MLP seam) and any other cross-domain pair:
+        deliberately NOT connected directly anymore. That coupling now flows
+        only through the conv_hub/mlp_hub virtual nodes (see
+        attach_hub_nodes()) — a single bottleneck edge between the two hubs,
+        so conv and MLP reasoning stay "not strongly connected" per design,
+        while every node in each domain still gets an aggregated signal from
+        the other domain via its own hub.
+    """
+    real_nodes = [n for n in nodes if n.node_kind != "hub"]
+    device = real_nodes[0].param.device if real_nodes else nodes[0].param.device
     layer_buckets: Dict[int, List[int]] = {}
     for i, n in enumerate(nodes):
+        if n.node_kind == "hub":
+            continue
         layer_buckets.setdefault(n.layer_idx, []).append(i)
 
     edges = []
     sorted_layers = sorted(layer_buckets.keys())
-    
-    # Intra-layer (existing)
+
+    def add_bidir(src: int, dst: int) -> None:
+        edges.append((src, dst))
+        edges.append((dst, src))
+
+    # Intra-layer: dense weight ↔ bias, plus local spatial conv edges.
     for ids in layer_buckets.values():
-        for i in ids:
-            for j in ids:
-                if i != j:
-                    edges.append((i, j))
-    
-    # Inter-layer: connect adjacent layers bidirectionally
+        weights = [i for i in ids if nodes[i].node_kind == "full" and not nodes[i].is_bias]
+        biases  = [i for i in ids if nodes[i].node_kind == "full" and nodes[i].is_bias]
+        for w in weights:
+            for b in biases:
+                add_bidir(w, b)
+
+        conv_weight_groups: Dict[Tuple[str, int], Dict[Tuple[int, int], int]] = {}
+        conv_bias_map: Dict[Tuple[str, int], int] = {}
+        for idx in ids:
+            node = nodes[idx]
+            if node.node_kind == "conv_weight":
+                key = (node.module_key, int(node.filter_idx))
+                conv_weight_groups.setdefault(key, {})[(int(node.spatial_row), int(node.spatial_col))] = idx
+            elif node.node_kind == "conv_bias":
+                conv_bias_map[(node.module_key, int(node.filter_idx))] = idx
+
+        # Optional diagnostic topology: connect same spatial location across
+        # different output filters in the same conv module.
+        if connect_conv_filters:
+            module_spatial_groups: Dict[str, Dict[Tuple[int, int], List[int]]] = {}
+            for (mod_key, _fidx), spatial_nodes in conv_weight_groups.items():
+                spatial_map = module_spatial_groups.setdefault(mod_key, {})
+                for rc, idx in spatial_nodes.items():
+                    spatial_map.setdefault(rc, []).append(idx)
+            for spatial_map in module_spatial_groups.values():
+                for idxs in spatial_map.values():
+                    if len(idxs) > 1:
+                        for i in range(len(idxs)):
+                            for j in range(i + 1, len(idxs)):
+                                add_bidir(idxs[i], idxs[j])
+
+        for key, spatial_nodes in conv_weight_groups.items():
+            for (row, col), idx in spatial_nodes.items():
+                for nbr in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)):
+                    nbr_idx = spatial_nodes.get(nbr)
+                    if nbr_idx is not None and idx < nbr_idx:
+                        add_bidir(idx, nbr_idx)
+
+                bias_idx = conv_bias_map.get(key)
+                if bias_idx is not None:
+                    add_bidir(idx, bias_idx)
+
+        # Intra-layer: connect each Linear weight row-group to its matching
+        # bias row-group (same row range within the same module) — the
+        # dense-layer analogue of the conv weight<->bias pairing above.
+        linear_weight_groups: Dict[Tuple[str, Tuple[int, int]], int] = {}
+        linear_bias_map: Dict[Tuple[str, Tuple[int, int]], int] = {}
+        for idx in ids:
+            node = nodes[idx]
+            if node.node_kind == "linear_row":
+                linear_weight_groups[(node.module_key, (int(node.row_start), int(node.row_end)))] = idx
+            elif node.node_kind == "linear_bias":
+                linear_bias_map[(node.module_key, (int(node.row_start), int(node.row_end)))] = idx
+        for key, w_idx in linear_weight_groups.items():
+            b_idx = linear_bias_map.get(key)
+            if b_idx is not None:
+                add_bidir(w_idx, b_idx)
+
+    def connector_ids(ids: List[int]) -> List[int]:
+        conv_biases = [i for i in ids if nodes[i].node_kind == "conv_bias"]
+        if conv_biases:
+            return conv_biases
+        linear_biases = [i for i in ids if nodes[i].node_kind == "linear_bias"]
+        if linear_biases:
+            return linear_biases
+        dense_weights = [i for i in ids if nodes[i].node_kind == "full" and not nodes[i].is_bias]
+        if dense_weights:
+            return dense_weights
+        linear_weights = [i for i in ids if nodes[i].node_kind == "linear_row"]
+        if linear_weights:
+            return linear_weights
+        return [i for i in ids if nodes[i].node_kind == "conv_weight"]
+
+    def _bucket_domain(ids: List[int]) -> str:
+        kinds = {nodes[i].node_kind for i in ids}
+        if kinds & {"conv_weight", "conv_bias"}:
+            return "conv"
+        if kinds & {"linear_row", "linear_bias"}:
+            return "linear"
+        return "other"
+
+    # Inter-layer wiring — domain-aware (see docstring above).
     for k in range(len(sorted_layers) - 1):
-        for src in layer_buckets[sorted_layers[k]]:
-            for dst in layer_buckets[sorted_layers[k + 1]]:
-                edges.append((src, dst))
-                edges.append((dst, src))
+        src_ids = layer_buckets[sorted_layers[k]]
+        dst_ids = layer_buckets[sorted_layers[k + 1]]
+        src_dom = _bucket_domain(src_ids)
+        dst_dom = _bucket_domain(dst_ids)
+
+        if src_dom == "linear" and dst_dom == "linear":
+            # Real full bipartite weight-matrix connectivity: literally every
+            # W[j, i] edge, not just a sampled/representative subset.
+            src_w = [i for i in src_ids if nodes[i].node_kind == "linear_row"]
+            dst_w = [i for i in dst_ids if nodes[i].node_kind == "linear_row"]
+            for s in src_w:
+                for d in dst_w:
+                    add_bidir(s, d)
+        elif src_dom == "conv" and dst_dom == "conv":
+            # Unchanged representative-node wiring between conv layers.
+            for s in connector_ids(src_ids):
+                for d in connector_ids(dst_ids):
+                    add_bidir(s, d)
+        elif src_dom == "other" or dst_dom == "other":
+            # Non-conv/non-linear params (e.g. plain "full" nodes for
+            # BN affine or coordinate-wise optimizees) keep the old
+            # connector-representative fallback so simple graphs still get
+            # an inter-layer edge.
+            for s in connector_ids(src_ids):
+                for d in connector_ids(dst_ids):
+                    add_bidir(s, d)
+        # else: conv <-> linear seam — deliberately NOT wired directly here;
+        # see attach_hub_nodes()/the hub-wiring block below.
+
+    # Hub wiring: if conv_hub/mlp_hub virtual nodes are present (attached via
+    # attach_hub_nodes() before this call), connect every conv node to
+    # conv_hub, every linear/MLP node to mlp_hub, and add the single
+    # conv_hub <-> mlp_hub bottleneck edge — the ONLY channel of information
+    # between the two domains.
+    conv_hub_idx = next(
+        (i for i, n in enumerate(nodes) if n.node_kind == "hub" and n.module_key == "conv_hub"), None
+    )
+    mlp_hub_idx = next(
+        (i for i, n in enumerate(nodes) if n.node_kind == "hub" and n.module_key == "mlp_hub"), None
+    )
+    if conv_hub_idx is not None:
+        for i, n in enumerate(nodes):
+            if n.node_kind in ("conv_weight", "conv_bias"):
+                add_bidir(i, conv_hub_idx)
+    if mlp_hub_idx is not None:
+        for i, n in enumerate(nodes):
+            if n.node_kind in ("linear_row", "linear_bias"):
+                add_bidir(i, mlp_hub_idx)
+    if conv_hub_idx is not None and mlp_hub_idx is not None:
+        add_bidir(conv_hub_idx, mlp_hub_idx)
 
     if not edges:
         return torch.zeros(2, 0, dtype=torch.long, device=device)
     return torch.tensor(edges, dtype=torch.long, device=device).t().contiguous()
+
+
+def build_mlp_predecessor_edges(
+    nodes: List[ParamNode],
+    connect_conv_filters: bool = False,
+) -> torch.Tensor:
+    """Return the base graph restricted to feed-forward MLP dependencies.
+
+    Conv and non-MLP portions of the graph are unchanged.  For an MLP target
+    node, however, an edge is retained only when its source belongs to the
+    immediately preceding MLP layer.  Consequently MLP weight/bias lateral
+    edges, reverse (later-to-earlier) edges, and hub-to-MLP edges are removed.
+
+    This is deliberately implemented as a filter over :func:`build_edges`:
+    the resulting topology is a strict subset of the normal construction and
+    can be used as a controlled graph-topology ablation.
+    """
+    edge_index = build_edges(nodes, connect_conv_filters=connect_conv_filters)
+    if edge_index.size(1) == 0:
+        return edge_index
+
+    mlp_kinds = {"linear_row", "linear_bias"}
+    mlp_layers = sorted({n.layer_idx for n in nodes if n.node_kind in mlp_kinds})
+    previous_mlp_layer = {
+        layer: mlp_layers[pos - 1] if pos > 0 else None
+        for pos, layer in enumerate(mlp_layers)
+    }
+
+    keep: List[bool] = []
+    for src_idx, dst_idx in edge_index.t().tolist():
+        src = nodes[src_idx]
+        dst = nodes[dst_idx]
+        if dst.node_kind not in mlp_kinds:
+            keep.append(True)
+            continue
+        keep.append(
+            src.node_kind in mlp_kinds
+            and previous_mlp_layer[dst.layer_idx] is not None
+            and src.layer_idx == previous_mlp_layer[dst.layer_idx]
+        )
+
+    mask = torch.tensor(keep, dtype=torch.bool, device=edge_index.device)
+    return edge_index[:, mask].contiguous()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Directional edge features
+#
+# build_edges() above adds every edge as a symmetric (src, dst) / (dst, src)
+# pair with no signal distinguishing the two directions, so a plain GATv2Conv
+# processes "I am the upstream supplier of this neighbour" and "I depend on
+# this neighbour" identically. The helpers below tag each edge with whether
+# it points downstream (same direction as the network's forward pass),
+# upstream (the reverse), or lateral (same layer — weight<->bias, conv
+# spatial neighbours), so message passing can learn direction-specific
+# behaviour instead of being direction-agnostic.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Indices of the tag entries inside the per-node feature vector produced by
+# ParamNode.features() — kept as explicit constants so edge_direction_from_
+# node_feats()/build_directional_edges() don't silently break if the feature
+# layout ever changes. layer_pos is monotonic in layer_idx within one graph;
+# is_conv/is_hub/is_mlp are the domain/hub one-hot tags added for the hub-node
+# redesign (see attach_hub_nodes() below).
+NODE_FEATURE_IS_CONV_IDX = 6
+NODE_FEATURE_LAYER_POS_IDX = 7
+NODE_FEATURE_IS_HUB_IDX = 10
+NODE_FEATURE_IS_MLP_IDX = 11
+
+# One-hot edge feature:
+#   [is_forward, is_backward, is_lateral, is_hub_edge, is_conv_domain, is_mlp_domain]
+# is_hub_edge    — either endpoint is a conv_hub/mlp_hub virtual node.
+# is_conv_domain — either endpoint belongs to the conv domain (conv node or
+#                  conv_hub itself).
+# is_mlp_domain  — either endpoint belongs to the MLP domain (linear node or
+#                  mlp_hub itself).
+# The conv_hub <-> mlp_hub bottleneck edge is the one edge with BOTH domain
+# flags set — a distinct, learnable signature for "this is the bridge".
+EDGE_ATTR_DIM = 6
+
+
+def build_directional_edges(
+    nodes: List[ParamNode],
+    connect_conv_filters: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Like build_edges(), but also returns the 6-dim edge tag described by
+    EDGE_ATTR_DIM above, derived from the true ParamNode list (node_kind +
+    layer_idx), rather than from node_feats (see edge_direction_from_node_feats
+    for the node_feats-only equivalent).
+
+    For a non-hub edge (src, dst):
+        forward  — src sits in an earlier layer than dst: src supplies
+                    information downstream to dst (same direction as the
+                    network's forward pass).
+        backward — src sits in a later layer than dst: src depends on dst
+                    (the reverse edge of a "forward" pair).
+        lateral  — src and dst are in the same layer (weight<->bias, conv
+                    spatial neighbours), OR either endpoint is a hub node
+                    (hub aggregation isn't a "forward pass" relationship).
+    """
+    edge_index = build_edges(nodes, connect_conv_filters=connect_conv_filters)
+    device = edge_index.device
+    if edge_index.size(1) == 0:
+        return edge_index, torch.zeros(0, EDGE_ATTR_DIM, device=device)
+
+    def _is_conv_domain(n: ParamNode) -> bool:
+        return n.node_kind in ("conv_weight", "conv_bias") or (
+            n.node_kind == "hub" and n.module_key == "conv_hub"
+        )
+
+    def _is_mlp_domain(n: ParamNode) -> bool:
+        return n.node_kind in ("linear_row", "linear_bias") or (
+            n.node_kind == "hub" and n.module_key == "mlp_hub"
+        )
+
+    layer_idx = torch.tensor([n.layer_idx for n in nodes], device=device, dtype=torch.float32)
+    is_hub_t = torch.tensor([1.0 if n.node_kind == "hub" else 0.0 for n in nodes], device=device)
+    is_conv_t = torch.tensor([1.0 if _is_conv_domain(n) else 0.0 for n in nodes], device=device)
+    is_mlp_t = torch.tensor([1.0 if _is_mlp_domain(n) else 0.0 for n in nodes], device=device)
+
+    src, dst = edge_index[0], edge_index[1]
+    hub_edge = ((is_hub_t[src] + is_hub_t[dst]) > 0).float()
+    not_hub = 1.0 - hub_edge
+
+    src_layer = layer_idx[src]
+    dst_layer = layer_idx[dst]
+    forward = (src_layer < dst_layer).float() * not_hub
+    backward = (src_layer > dst_layer).float() * not_hub
+    lateral = 1.0 - forward - backward
+
+    is_conv_domain = ((is_conv_t[src] + is_conv_t[dst]) > 0).float()
+    is_mlp_domain = ((is_mlp_t[src] + is_mlp_t[dst]) > 0).float()
+    edge_attr = torch.stack([forward, backward, lateral, hub_edge, is_conv_domain, is_mlp_domain], dim=1)
+    return edge_index, edge_attr
+
+
+def edge_direction_from_node_feats(edge_index: torch.Tensor, node_feats: torch.Tensor) -> torch.Tensor:
+    """Derive the same 6-dim edge tag as build_directional_edges(), but
+    purely from an already-built edge_index plus node_feats — no ParamNode
+    list required.
+
+    Relies on the layer_pos / is_conv / is_hub / is_mlp entries at the
+    NODE_FEATURE_*_IDX constants above (all baked into every node's feature
+    vector by ParamNode.features()), which lets a variant recover direction
+    and domain/hub tags from just the (node_feats, edge_index) pair that
+    GNNOptimiser._forward already threads through — no changes needed to any
+    harness call site.
+    """
+    device = edge_index.device
+    if edge_index.size(1) == 0:
+        return torch.zeros(0, EDGE_ATTR_DIM, device=device)
+
+    layer_pos = node_feats[:, NODE_FEATURE_LAYER_POS_IDX]
+    is_hub = node_feats[:, NODE_FEATURE_IS_HUB_IDX]
+    is_conv = node_feats[:, NODE_FEATURE_IS_CONV_IDX]
+    is_mlp = node_feats[:, NODE_FEATURE_IS_MLP_IDX]
+
+    src, dst = edge_index[0], edge_index[1]
+    hub_edge = ((is_hub[src] + is_hub[dst]) > 0).float()
+    not_hub = 1.0 - hub_edge
+
+    src_pos = layer_pos[src]
+    dst_pos = layer_pos[dst]
+    eps = 1e-6
+    forward = (src_pos < dst_pos - eps).float() * not_hub
+    backward = (src_pos > dst_pos + eps).float() * not_hub
+    lateral = 1.0 - forward - backward
+
+    is_conv_domain = ((is_conv[src] + is_conv[dst]) > 0).float()
+    is_mlp_domain = ((is_mlp[src] + is_mlp[dst]) > 0).float()
+    return torch.stack([forward, backward, lateral, hub_edge, is_conv_domain, is_mlp_domain], dim=1)
+
+
+def attach_hub_nodes(
+    nodes: List[ParamNode],
+    conv_hub_embedding: Optional[torch.Tensor] = None,
+    mlp_hub_embedding: Optional[torch.Tensor] = None,
+) -> List[ParamNode]:
+    """Append up to two virtual 'hub' nodes to `nodes` (must be called BEFORE
+    build_edges()/build_directional_edges() so the hub-wiring block in
+    build_edges() can find them):
+
+      - conv_hub: bidirectionally wired to every conv node (weight + bias).
+      - mlp_hub:  bidirectionally wired to every linear/MLP node (weight + bias).
+      - a single bottleneck edge connects conv_hub <-> mlp_hub when both are
+        present — the ONLY channel of information between the two domains,
+        so conv and MLP reasoning stay "not strongly connected" while every
+        node still gets an aggregated signal from the other domain via its
+        own hub (a "virtual/master node" trick, same idea used by GIN and
+        similar architectures for long-range signal).
+
+    Hub nodes have no backing parameter tensor — they exist purely for
+    message passing and are skipped by _apply_node_updates()/_apply_update().
+
+    `conv_hub_embedding`/`mlp_hub_embedding` should be learned nn.Parameter
+    tensors of shape (NODE_DIM,), owned by the calling GNN module, so the hub
+    starts from a meaningful, trainable identity instead of dead zeros. When
+    omitted, falls back to a fixed zero vector on the same device as the rest
+    of the graph (e.g. for a variant that hasn't been wired up with its own
+    learned hub embeddings).
+    """
+    has_conv = any(n.node_kind in ("conv_weight", "conv_bias") for n in nodes)
+    has_mlp = any(n.node_kind in ("linear_row", "linear_bias") for n in nodes)
+    if not has_conv and not has_mlp:
+        return nodes
+
+    real_with_param = next((n for n in nodes if n.param is not None), None)
+    device = real_with_param.param.device if real_with_param is not None else torch.device("cpu")
+    zeros = torch.zeros(NODE_DIM, device=device)
+
+    extra: List[ParamNode] = []
+    if has_conv:
+        embed = conv_hub_embedding if conv_hub_embedding is not None else zeros
+        extra.append(ParamNode(
+            "__conv_hub__", None, None, layer_idx=-1, is_bias=False,
+            node_kind="hub", module_key="conv_hub", hub_embed=embed,
+        ))
+    if has_mlp:
+        embed = mlp_hub_embedding if mlp_hub_embedding is not None else zeros
+        extra.append(ParamNode(
+            "__mlp_hub__", None, None, layer_idx=-1, is_bias=False,
+            node_kind="hub", module_key="mlp_hub", hub_embed=embed,
+        ))
+    return nodes + extra
+
+
+def _module_key_from_name(name: str) -> str:
+    parts = name.split(".")
+    return ".".join(parts[:-1]) if len(parts) > 1 else name
+
+
+def _linear_row_groups(out_features: int) -> List[Tuple[int, int]]:
+    """One contiguous (start, end) row range per output neuron.
+
+    Every `Linear` layer's output unit becomes exactly one node (matching
+    the "one circle == one node" design) — no grouping/capping. Inter-layer
+    Linear->Linear edges are now real full-bipartite W[j,i] connectivity
+    (see build_edges), so there's no O(n^2)-blowup concern to cap against
+    here; the only place a fixed bound is enforced is the conv<->MLP seam,
+    which goes through the constant-size hub bottleneck instead (see
+    attach_hub_nodes above).
+    """
+    out_features = int(out_features)
+    if out_features <= 0:
+        return []
+    return [(i, i + 1) for i in range(out_features)]
+
+
+def build_param_nodes(
+    params: Dict[str, torch.Tensor],
+    grads: Dict[str, torch.Tensor],
+) -> List[ParamNode]:
+    nodes: List[ParamNode] = []
+    all_names = list(params.keys())
+    conv_modules = {
+        _module_key_from_name(name)
+        for name, param in params.items()
+        if name.endswith("weight") and param.dim() == 4
+    }
+    linear_modules = {
+        _module_key_from_name(name)
+        for name, param in params.items()
+        if name.endswith("weight") and param.dim() == 2
+    }
+
+    for name, p in params.items():
+        g = grads[name]
+        layer_idx = _layer_idx_from_name(name, all_names)
+        is_bias = "bias" in name
+        module_key = _module_key_from_name(name)
+
+        if name.endswith("weight") and p.dim() == 4:
+            out_channels, _, kernel_h, kernel_w = p.shape
+            for filter_idx in range(out_channels):
+                for row in range(kernel_h):
+                    for col in range(kernel_w):
+                        nodes.append(
+                            ParamNode(
+                                name,
+                                p[filter_idx, :, row, col],
+                                g[filter_idx, :, row, col],
+                                layer_idx,
+                                False,
+                                is_conv_node=True,
+                                module_key=module_key,
+                                filter_idx=filter_idx,
+                                spatial_row=row,
+                                spatial_col=col,
+                                node_kind="conv_weight",
+                            )
+                        )
+        elif is_bias and module_key in conv_modules and p.dim() == 1:
+            for filter_idx in range(p.shape[0]):
+                nodes.append(
+                    ParamNode(
+                        name,
+                        p[filter_idx:filter_idx + 1],
+                        g[filter_idx:filter_idx + 1],
+                        layer_idx,
+                        True,
+                        is_conv_node=True,
+                        module_key=module_key,
+                        filter_idx=filter_idx,
+                        node_kind="conv_bias",
+                    )
+                )
+        elif name.endswith("weight") and p.dim() == 2:
+            out_features = p.shape[0]
+            for row_start, row_end in _linear_row_groups(out_features):
+                nodes.append(
+                    ParamNode(
+                        name,
+                        p[row_start:row_end, :],
+                        g[row_start:row_end, :],
+                        layer_idx,
+                        False,
+                        is_conv_node=False,
+                        module_key=module_key,
+                        row_start=row_start,
+                        row_end=row_end,
+                        node_kind="linear_row",
+                    )
+                )
+        elif is_bias and module_key in linear_modules and p.dim() == 1:
+            out_features = p.shape[0]
+            for row_start, row_end in _linear_row_groups(out_features):
+                nodes.append(
+                    ParamNode(
+                        name,
+                        p[row_start:row_end],
+                        g[row_start:row_end],
+                        layer_idx,
+                        True,
+                        is_conv_node=False,
+                        module_key=module_key,
+                        row_start=row_start,
+                        row_end=row_end,
+                        node_kind="linear_bias",
+                    )
+                )
+        else:
+            nodes.append(
+                ParamNode(
+                    name,
+                    p,
+                    g,
+                    layer_idx,
+                    is_bias,
+                    is_conv_node=False,
+                    module_key=module_key,
+                    node_kind="full",
+                )
+            )
+
+    return nodes
+
+
+def build_node_features(
+    nodes: List[ParamNode],
+    step: int,
+    momentum_buffers: Optional[Dict[str, torch.Tensor]] = None,
+) -> torch.Tensor:
+    if momentum_buffers is None:
+        momentum_buffers = {}
+    return torch.stack([
+        node.features(
+            step,
+            len(nodes),
+            momentum_buffer=momentum_buffers.get(node.name),
+            # The Adam-style second-moment EMA is already computed and
+            # persisted by _apply_node_updates() under this "__v__"-suffixed
+            # key (part of the same momentum_buffers dict threaded through
+            # every call site already) -- surface it as a feature too (see
+            # g_to_v_ratio in ParamNode.features()) instead of leaving it
+            # write-only.
+            second_moment_buffer=momentum_buffers.get(node.name + "__v__"),
+        )
+        for node in nodes
+    ])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GNN building blocks
@@ -248,27 +831,36 @@ def build_edges(nodes: List[ParamNode]) -> torch.Tensor:
 from torch_geometric.nn import GATv2Conv
 
 class GATv2MetaLayer(nn.Module):
-    def __init__(self, in_dim, out_dim, heads=4):
+    """GATv2 message-passing layer, conditioned on a per-edge
+    [forward, backward, lateral] direction feature (see
+    edge_direction_from_node_feats / build_directional_edges above) via
+    GATv2Conv's built-in edge_dim support — so attention can learn different
+    behaviour for "I supply this neighbour" vs. "I depend on this neighbour"
+    instead of treating every edge identically.
+    """
+
+    def __init__(self, in_dim, out_dim, heads=4, edge_dim: int = EDGE_ATTR_DIM):
         super().__init__()
         # PyG's GATv2Conv handles the multi-head split and dynamic attention
-        self.conv = GATv2Conv(in_dim, out_dim // heads, heads=heads, concat=True)
+        self.conv = GATv2Conv(in_dim, out_dim // heads, heads=heads, concat=True, edge_dim=edge_dim)
         self.norm = nn.LayerNorm(out_dim)
         self.act = nn.SiLU()
         self.res_proj = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
-        self.global_mlp = nn.Sequential(
-            nn.Linear(out_dim, out_dim), nn.SiLU(),
-            nn.Linear(out_dim, out_dim),
-        )
 
-    def forward(self, h, edge_index):
-        # h: (N, in_dim), edge_index: (2, E)
+    def forward(self, h, edge_index, edge_attr):
+        # h: (N, in_dim), edge_index: (2, E), edge_attr: (E, EDGE_ATTR_DIM)
         res = self.res_proj(h)
-        h = self.conv(h, edge_index)
-        global_stats = torch.mean(h, dim=0, keepdim=True)
-        global_context = torch.mean(h, dim=0, keepdim=True) # Simple global pool
-        h = self.norm(h+res)
+        h_msg = self.conv(h, edge_index, edge_attr=edge_attr)
+        # NOTE: this used to also add a `global_mlp(h_msg.mean(dim=0))`
+        # global-context term broadcast to every node, predating the
+        # conv_hub/mlp_hub virtual-node redesign. It was removed (this
+        # session) because an unrestricted mean over ALL nodes every layer
+        # bypassed the hub bottleneck entirely (the whole point of the hub
+        # design is that conv/MLP domains should only exchange information
+        # through the single conv_hub<->mlp_hub edge) -- it was leftover
+        # from before that redesign, not an intentional shortcut.
+        h = self.norm(h_msg + res)
         h = self.act(h)
-        # Assuming in_dim == out_dim for a residual connection
         return h
     
 class EdgeNet(nn.Module):
@@ -304,15 +896,34 @@ class GNNLayer(nn.Module):
         self.node_net = NodeUpdateNet(node_dim, hidden_dim, hidden_dim)
         self.res_proj = nn.Linear(node_dim, hidden_dim) if node_dim != hidden_dim else nn.Identity()
 
-    def forward(self, h: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+    def forward(self, h: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
         N, device = h.size(0), h.device
         if edge_index.size(1) == 0:
             agg = torch.zeros(N, self.hidden_dim, device=device)
         else:
-            agg = self.edge_net(h, edge_index)  # (N, hidden_dim)
+            agg = self.edge_net(h, edge_index, edge_attr)  # (N, hidden_dim)
         res = self.res_proj(h)
         updated = self.node_net(h, agg)
         return updated + res
+
+
+def _layer_idx_from_name(name: str, all_names: List[str]) -> int:
+    """Map a parameter name to a semantic layer index.
+
+    Groups by module prefix (everything except the final '.weight'/'.bias'
+    component), so conv/linear layers in deeper nets get a stable positional
+    index regardless of enumeration order.
+    """
+    parts = name.split(".")
+    key = ".".join(parts[:-1]) if len(parts) > 1 else name
+    # Build a de-duplicated ordered list of unique module prefixes
+    seen: Dict[str, int] = {}
+    for n in all_names:
+        p = n.split(".")
+        k = ".".join(p[:-1]) if len(p) > 1 else n
+        if k not in seen:
+            seen[k] = len(seen)
+    return seen.get(key, 0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -340,8 +951,8 @@ class GNNMetaLearner(nn.Module):
                  num_gnn_layers: int = 3,
                  gat_heads: int = 4,
                  update_lr: float = 0.1,
-                 weight_clip: Optional[float] = None,
-                 bias_clip: Optional[float] = None):
+                 weight_clip: Optional[float] = 0.5,
+                 bias_clip: Optional[float] = 0.2):
         super().__init__()
         self.update_lr = update_lr
         self.gat_heads = gat_heads
@@ -358,6 +969,19 @@ class GNNMetaLearner(nn.Module):
             nn.Linear(hidden_dim, hidden_dim // 2), nn.SiLU(),
             nn.Linear(hidden_dim // 2, 3),
         )
+
+        # Learned identity embeddings for the conv/MLP virtual hub nodes (see
+        # attach_hub_nodes()) — trainable so each hub starts from a
+        # meaningful representation rather than dead zeros.
+        self.conv_hub_embedding = nn.Parameter(torch.randn(NODE_DIM) * 0.01)
+        self.mlp_hub_embedding = nn.Parameter(torch.randn(NODE_DIM) * 0.01)
+
+    def _attach_hubs(self, nodes: List[ParamNode]) -> List[ParamNode]:
+        return attach_hub_nodes(nodes, self.conv_hub_embedding, self.mlp_hub_embedding)
+
+    def _build_edges(self, nodes: List[ParamNode]) -> torch.Tensor:
+        """Build this model's topology; variants may override this hook."""
+        return build_edges(nodes)
 
     def _reset_weights(self):
         for m in self.modules():
@@ -380,15 +1004,129 @@ class GNNMetaLearner(nn.Module):
         deltas : (N, 2) — two scalars per parameter node
         momentum_coeff : (N, 1) — momentum coefficient per parameter node
         """
+        edge_attr = edge_direction_from_node_feats(edge_index, node_feats)
         h = self.input_proj(node_feats)
         for layer in self.gnn:
-            h = layer(h, edge_index)
+            h = layer(h, edge_index, edge_attr)
         raw_out = self.output_head(h)
         delta = torch.tanh(raw_out[:, 0])
         momentum_coeff = torch.sigmoid(raw_out[:, 1])
+        momentum_coeff = momentum_coeff.clamp(0, 0.95)
         log_lr = raw_out[:, 2]  # learned log step size, unconstrained
         step_size = torch.exp(log_lr.clamp(-8, 0))  # step_size ∈ [3.4e-4, 1.0]
         return delta, momentum_coeff, step_size
+
+    # Hard, param-magnitude-independent ceiling on a single coordinate's
+    # per-step update. The relative clip below (based on current param RMS)
+    # can still permit a multi-unit-RMS jump once param RMS grows past its
+    # own internal max=10.0 cap (e.g. up to clip_ratio * 10.0 == 5.0 for the
+    # default weight_clip=0.5) — a jump that size, repeated over hundreds of
+    # steps with a consistent sign, is exactly what produces the observed
+    # exponential-looking loss blowups (loss climbing into the hundreds/
+    # thousands within a few hundred steps). This absolute cap bounds the
+    # worst case regardless of param scale or how many steps compound.
+    _ABS_UPDATE_CAP = 0.7
+
+    def _stabilize_update(self,
+                          param: torch.Tensor,
+                          update: torch.Tensor,
+                          is_bias: bool,
+                          update_lr_override: Optional[float] = None) -> torch.Tensor:
+        effective_update_lr = self.update_lr if update_lr_override is None else update_lr_override
+        update = effective_update_lr * update
+        clip_ratio = self.bias_clip if is_bias else self.weight_clip
+        if clip_ratio is not None:
+            p_rms = param.pow(2).mean().sqrt()
+            p_rms_safe = p_rms.clamp(min=1e-3, max=10.0)
+            upd_rms = update.pow(2).mean().sqrt().clamp(min=1e-8)
+            relative_scale = upd_rms / p_rms_safe
+            update = update * (float(clip_ratio) / relative_scale).clamp(max=1.0)
+
+        # Absolute safety net on top of the relative clip above (see
+        # _ABS_UPDATE_CAP docstring) — prevents runaway/compounding growth
+        # that the relative clip alone cannot fully bound.
+        return update.clamp(min=-self._ABS_UPDATE_CAP, max=self._ABS_UPDATE_CAP)
+
+    @staticmethod
+    def _effective_coordinate_update_lr(nodes, update_lr: float) -> float:
+        if len(nodes) == 1 and getattr(nodes[0], "name", None) == "x":
+            return max(update_lr, 0.1)
+        return update_lr
+
+    def _apply_node_updates(self,
+                            nodes: List[ParamNode],
+                            params: Dict[str, torch.Tensor],
+                            deltas: torch.Tensor,
+                            momentum_coeff: torch.Tensor,
+                            step_size: torch.Tensor,
+                            momentum_buffers: Optional[Dict[str, torch.Tensor]],
+                            step: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        if momentum_buffers is None:
+            momentum_buffers = {}
+
+        effective_update_lr = self._effective_coordinate_update_lr(nodes, self.update_lr)
+        param_updates = {
+            name: torch.zeros_like(param)
+            for name, param in params.items()
+        }
+        new_momentum_buffers = {
+            name: torch.zeros_like(param)
+            for name, param in params.items()
+        }
+        for name, param in params.items():
+            new_momentum_buffers[name + "__v__"] = torch.zeros_like(param)
+
+        for i, node in enumerate(nodes):
+            if node.node_kind == "hub":
+                continue  # virtual node — no real param to update
+            name = node.name
+            p = node.param
+            g = node.grad
+
+            m_prev_full = momentum_buffers.get(name, torch.zeros_like(params[name]))
+            m_prev = node.slice_tensor(m_prev_full)
+
+            beta = momentum_coeff[i]
+            m_new = beta * m_prev + (1 - beta) * g
+
+            beta2 = 0.999
+            v_key = name + "__v__"
+            v_prev_full = momentum_buffers.get(v_key, torch.zeros_like(params[name]))
+            v_prev = node.slice_tensor(v_prev_full)
+            v_new = beta2 * v_prev + (1 - beta2) * g.pow(2)
+            bc = 1.0 - beta2 ** (step + 1)
+            v_hat_rms = (v_new / bc).mean().sqrt().clamp(min=1e-3)
+            update = step_size[i] * deltas[i] * m_new / v_hat_rms
+
+            # Convergence damping: dividing by v_hat_rms (Adam-style
+            # normalization) keeps the update magnitude roughly constant
+            # even once the true gradient has vanished near a good minimum
+            # (v_hat_rms shrinks right along with it), so nothing in the
+            # formula above actually encourages smaller steps on
+            # convergence. Multiply by the raw, un-normalized gradient
+            # magnitude (clamped to at most 1 so large gradients don't
+            # inflate the step further) so the update genuinely shrinks in
+            # lock-step with a genuinely vanishing gradient instead of
+            # being renormalized back up to full size.
+            #grad_activity = g.abs().mean().clamp(max=1.0)
+            #update = update * grad_activity
+
+            update = self._stabilize_update(p, update, node.is_bias, effective_update_lr)
+
+            node.assign_into(param_updates[name], update)
+            node.assign_into(new_momentum_buffers[name], m_new)
+            node.assign_into(new_momentum_buffers[v_key], v_new)
+
+        new_params = {
+            # nan_to_num + a generous absolute clamp guards against any
+            # residual blowup/NaN propagating forward into subsequent steps
+            # (a single bad step would otherwise poison every later step).
+            name: torch.nan_to_num(
+                params[name] + param_updates[name], nan=0.0, posinf=1e2, neginf=-1e2
+            ).clamp(min=-1e2, max=1e2)
+            for name in params.keys()
+        }
+        return new_params, new_momentum_buffers
 
     # ── differentiable inner step (for meta-training) ─────────────────────
 
@@ -427,16 +1165,10 @@ class GNNMetaLearner(nn.Module):
         grads = dict(zip(params.keys(), grads))
 
         # Step 3: build graph and run GNN (retains grad)
-        nodes = []
-        for i, (name, p) in enumerate(params.items()):
-            g = grads[name]
-            nodes.append(ParamNode(name, p, g, i, "bias" in name))
+        nodes = self._attach_hubs(build_param_nodes(params, grads))
+        node_feats = build_node_features(nodes, step, momentum_buffers)
 
-        node_feats = torch.stack([
-            n.features(step, len(nodes), momentum_buffer=momentum_buffers.get(n.name, torch.zeros_like(n.grad))) for n in nodes
-        ])
-
-        edge_index = build_edges(nodes).to(node_feats.device)
+        edge_index = self._build_edges(nodes).to(node_feats.device)
 
         # GNN forward — this is differentiable w.r.t. GNN weights
         deltas, momentum_coeff, step_size = self(node_feats, edge_index)
@@ -445,36 +1177,15 @@ class GNNMetaLearner(nn.Module):
         deltas = torch.clamp(deltas, min=-1.0, max=1.0)
         momentum_coeff = torch.clamp(momentum_coeff, min=0.0, max=1.0)
         step_size = torch.clamp(step_size, min=1e-4, max=1.0)
-
-        new_params = {}
-        new_momentum_buffers = {}
-
-        for i, node in enumerate(nodes):
-            name = node.name
-            p = params[name]
-            g = grads[name]
-
-            m_prev = momentum_buffers.get(name, torch.zeros_like(g))
-
-            beta = momentum_coeff[i]
-            m_new = beta * m_prev + (1 - beta) * g
-
-            # Adam-style second-moment buffer stored under a __v__ key.
-            # v retains memory of past large gradients: when g→0 near convergence,
-            # v_hat_rms stays large → steps decay naturally → convergence.
-            # Using instantaneous g_rms would blow up: 1/g_rms → ∞ as g→0.
-            beta2 = 0.999
-            v_key = name + "__v__"
-            v_prev = momentum_buffers.get(v_key, torch.zeros_like(g))
-            v_new = beta2 * v_prev + (1 - beta2) * g.pow(2)
-            bc = 1.0 - beta2 ** (step + 1)  # bias correction
-            v_hat_rms = (v_new / bc).mean().sqrt().clamp(min=1e-8)
-            update = step_size[i] * deltas[i] * m_new / (v_hat_rms + 1e-8)
-
-            new_params[name] = p + update
-
-            new_momentum_buffers[name] = m_new
-            new_momentum_buffers[v_key] = v_new
+        new_params, new_momentum_buffers = self._apply_node_updates(
+            nodes,
+            params,
+            deltas,
+            momentum_coeff,
+            step_size,
+            momentum_buffers,
+            step,
+        )
 
         # ---- 5. Compute next loss (connected graph!) ----
         # new_params = {
@@ -512,15 +1223,12 @@ class GNNMetaLearner(nn.Module):
         }
 
         # 2. Build graph/features from provided params and grads
-        nodes = []
-        for i, (name, p) in enumerate(params.items()):
-            g = grads[name]
-            nodes.append(ParamNode(name, p, g, i, "bias" in name))
+        nodes = self._attach_hubs(build_param_nodes(params, grads))
 
         if not nodes:
             return loss.item(), params, momentum_buffers
 
-        node_feats = torch.stack([n.features(step, len(nodes), momentum_buffer=momentum_buffers.get(n.name, torch.zeros_like(n.grad))) for n in nodes])
+        node_feats = build_node_features(nodes, step, momentum_buffers)
         edge_index = build_edges(nodes).to(node_feats.device)
 
         # 3. GNN Forward
@@ -529,34 +1237,16 @@ class GNNMetaLearner(nn.Module):
             deltas = torch.nan_to_num(deltas, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1.0, 1.0)
             momentum_coeff = torch.nan_to_num(momentum_coeff, nan=0.5, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
             step_size = torch.nan_to_num(step_size, nan=1e-3, posinf=1.0, neginf=1e-3).clamp(1e-4, 1.0)
-
         # 4. Build new params dictionary (functional, no in-place writes)
-        new_params = {}
-        new_momentum_buffers = {}
-
-        for i, node in enumerate(nodes):
-            name = node.name
-            p = params[name]
-            g = grads[name]
-
-            m_prev = momentum_buffers.get(name, torch.zeros_like(g))
-
-            beta = momentum_coeff[i]
-            m_new = beta * m_prev + (1 - beta) * g
-
-            # Adam-style second-moment buffer — same rule as inner_step
-            beta2 = 0.999
-            v_key = name + "__v__"
-            v_prev = momentum_buffers.get(v_key, torch.zeros_like(g))
-            v_new = beta2 * v_prev + (1 - beta2) * g.pow(2)
-            bc = 1.0 - beta2 ** (step + 1)
-            v_hat_rms = (v_new / bc).mean().sqrt().clamp(min=1e-8)
-            update = step_size[i] * deltas[i] * m_new / (v_hat_rms + 1e-8)
-
-            new_params[name] = p + update
-
-            new_momentum_buffers[name] = m_new
-            new_momentum_buffers[v_key] = v_new
+        new_params, new_momentum_buffers = self._apply_node_updates(
+            nodes,
+            params,
+            deltas,
+            momentum_coeff,
+            step_size,
+            momentum_buffers,
+            step,
+        )
 
         next_loss = optimizee.loss(new_params)
         next_loss = torch.where(
@@ -587,6 +1277,24 @@ def _grad_surgery(candidate: Dict[str, torch.Tensor],
         result[name] = gc.view_as(g_cand)
     return result
 
+
+def _scheduled_warmstart_steps(epoch: int, epochs: int, unroll: int, warmstart_frac: float) -> int:
+    if warmstart_frac <= 0.0 or unroll <= 0:
+        return 0
+
+    max_warmstart = int(round(unroll * warmstart_frac))
+    max_warmstart = max(0, max_warmstart)
+
+    if max_warmstart == 0:
+        return 0
+
+    progress = (epoch - 1) / max(epochs - 1, 1)
+    return int(round(progress * max_warmstart))
+
+
+def _problem_allows_warmstart(problem_name: str) -> bool:
+    return problem_name not in {"quadratic", "lasso"}
+
 def meta_train(
     meta: GNNMetaLearner,
     problem_names: List[str],
@@ -597,6 +1305,7 @@ def meta_train(
     save_path: Optional[str] = None,
     log_every: int = 5,
     seed: Optional[int] = 0,
+    warmstart_frac: float = 0.5,
 ) -> List[float]:
     """
     Open-L2O outer-loop training.
@@ -666,10 +1375,29 @@ def meta_train(
         t_trunc = 10 # max(2, min(10, 2 + epoch // (epochs // 8)))
         epoch_total_loss = 0.0
         first_loss = None
+        warmstart_steps = (
+            _scheduled_warmstart_steps(epoch, epochs, unroll, warmstart_frac)
+            if _problem_allows_warmstart(prob_name)
+            else 0
+        )
 
-        # Each epoch, starting from reset position (no warm-start — would cause
-        # train/test distribution mismatch: training from near-convergence but
-        # evaluating from the raw initial position).
+        for warm_t in range(warmstart_steps):
+            _, params, momentum_buffers = meta.eval_step(
+                prob,
+                params=params,
+                step=warm_t,
+                momentum_buffers=momentum_buffers,
+            )
+
+        if warmstart_steps > 0:
+            params = {
+                k: v.detach().requires_grad_(True)
+                for k, v in params.items()
+            }
+            momentum_buffers = {
+                k: v.detach() for k, v in momentum_buffers.items()
+            }
+
         with torch.no_grad():
             raw_first = float(prob.loss(params).detach().clamp(min=1e-6))
         if loss_ema[prob_name] is None:
@@ -681,7 +1409,7 @@ def meta_train(
             loss_t, params, momentum_buffers = meta.inner_step(
                 prob,
                 params,
-                step=t,
+                step=warmstart_steps + t,
                 momentum_buffers=momentum_buffers
             )
             
@@ -780,6 +1508,7 @@ def meta_train(
         scheduler.step()
         if epoch % log_every == 0 or epoch == 1:
             print(f"  Epoch {epoch:4d}/{epochs} | "
+                  f"warmstart = {warmstart_steps:2d} | "
                   f"meta-loss = {epoch_total_loss:.4f} | "
                   f"ema = {ema_loss:.4f} | "
                   f"problem = {prob_name}")
@@ -797,6 +1526,7 @@ def meta_train(
                 'hidden_dim': meta.input_proj[0].out_features, # Extract from model
                 'num_gnn_layers': len(meta.gnn),
                 'train_unroll': unroll,
+                        'warmstart_frac': warmstart_frac,
                 'gat_heads': meta.gat_heads,
                 'update_lr': meta.update_lr,
                 'weight_clip': meta.weight_clip,
@@ -975,36 +1705,27 @@ def evaluate2(
                     grads = torch.autograd.grad(loss, params.values(), create_graph=False)
                     grads = dict(zip(params.keys(), grads))
 
-                    nodes = []
-                    for i, (name, p) in enumerate(params.items()):
-                        nodes.append(ParamNode(name, p, grads[name], i, "bias" in name))
-
-                    node_feats = torch.stack([
-                        n.features(step, len(nodes),
-                                   momentum_buffer=(buffers or {}).get(n.name, torch.zeros_like(n.grad)))
-                        for n in nodes
-                    ])
+                    nodes = meta._attach_hubs(build_param_nodes(params, grads))
+                    node_feats = build_node_features(nodes, step, buffers or {})
 
                     edge_index = build_edges(nodes).to(device)
 
                     with torch.no_grad():
                         deltas, momentum_coeff, step_size = meta(node_feats, edge_index)
 
-                    new_params = {}
-                    new_buffers = {}
+                    deltas = torch.nan_to_num(deltas, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1.0, 1.0)
+                    momentum_coeff = torch.nan_to_num(momentum_coeff, nan=0.5, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+                    step_size = torch.nan_to_num(step_size, nan=1e-3, posinf=1.0, neginf=1e-3).clamp(1e-4, 1.0)
 
-                    for i, node in enumerate(nodes):
-                        name = node.name
-                        p = params[name]
-                        g = grads[name]
-
-                        m_prev = (buffers or {}).get(name, torch.zeros_like(g))
-                        beta = momentum_coeff[i]
-                        m_new = beta * m_prev + (1 - beta) * g
-
-                        update = step_size[i] * deltas[i] * m_new
-                        new_params[name] = p + update
-                        new_buffers[name] = m_new
+                    new_params, new_buffers = meta._apply_node_updates(
+                        nodes,
+                        params,
+                        deltas,
+                        momentum_coeff,
+                        step_size,
+                        buffers or {},
+                        step,
+                    )
 
                     params = {k: v.detach().requires_grad_(True) for k, v in new_params.items()}
                     buffers = {k: v.detach() for k, v in new_buffers.items()}
@@ -1154,36 +1875,27 @@ def evaluate3(
                     grads = torch.autograd.grad(loss, params.values(), create_graph=False)
                     grads = dict(zip(params.keys(), grads))
 
-                    nodes = []
-                    for i, (name, p) in enumerate(params.items()):
-                        nodes.append(ParamNode(name, p, grads[name], i, "bias" in name))
-
-                    node_feats = torch.stack([
-                        n.features(step, len(nodes),
-                                   momentum_buffer=(buffers or {}).get(n.name, torch.zeros_like(n.grad)))
-                        for n in nodes
-                    ])
+                    nodes = meta._attach_hubs(build_param_nodes(params, grads))
+                    node_feats = build_node_features(nodes, step, buffers or {})
 
                     edge_index = build_edges(nodes).to(device)
 
                     with torch.no_grad():
                         deltas, momentum_coeff, step_size = meta(node_feats, edge_index)
 
-                    new_params = {}
-                    new_buffers = {}
+                    deltas = torch.nan_to_num(deltas, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1.0, 1.0)
+                    momentum_coeff = torch.nan_to_num(momentum_coeff, nan=0.5, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+                    step_size = torch.nan_to_num(step_size, nan=1e-3, posinf=1.0, neginf=1e-3).clamp(1e-4, 1.0)
 
-                    for i, node in enumerate(nodes):
-                        name = node.name
-                        p = params[name]
-                        g = grads[name]
-
-                        m_prev = (buffers or {}).get(name, torch.zeros_like(g))
-                        beta = momentum_coeff[i]
-                        m_new = beta * m_prev + (1 - beta) * g
-
-                        update = step_size[i] * deltas[i] * m_new
-                        new_params[name] = p + update
-                        new_buffers[name] = m_new
+                    new_params, new_buffers = meta._apply_node_updates(
+                        nodes,
+                        params,
+                        deltas,
+                        momentum_coeff,
+                        step_size,
+                        buffers or {},
+                        step,
+                    )
 
                     params = {k: v.detach().requires_grad_(True) for k, v in new_params.items()}
                     buffers = {k: v.detach() for k, v in new_buffers.items()}
@@ -1314,6 +2026,7 @@ def main():
     t.add_argument("--hidden",   type=int,   default=64)
     t.add_argument("--layers",   type=int,   default=3)
     t.add_argument("--update_lr",type=float, default=0.01)
+    t.add_argument("--warmstart_frac", type=float, default=0.5)
     t.add_argument("--save",     type=str,   default="gnn_meta.pt")
     t.add_argument("--device",   type=str,   default="cpu")
     t.add_argument("--seed",     type=int,   default=0)
@@ -1353,7 +2066,8 @@ def main():
                    epochs=args.epochs, unroll=args.unroll,
                    meta_lr=args.lr, device=args.device,
                    save_path=args.save,
-                   seed=args.seed)
+                   seed=args.seed,
+                   warmstart_frac=args.warmstart_frac)
 
     elif args.cmd == "eval":
         # Load the checkpoint dictionary
